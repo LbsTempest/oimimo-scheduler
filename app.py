@@ -4007,6 +4007,65 @@ _feed_proc = None
 _feed_thread = None  # frozen 模式降级线程引用
 _feed_server_lock = threading.Lock()
 
+
+def _ensure_feed_firewall():
+    """Windows 防火墙管理（仅 frozen exe 生效）。
+
+    已有 allow 规则 → 静默放行（不再弹窗）。
+    存在 deny 规则（用户曾取消/拒绝）→ 删除，让 Windows 下次监听时重新弹窗。
+    无任何规则 → 不动作，Windows 首次监听自动弹窗。
+    """
+    if os.name != 'nt' or not getattr(sys, 'frozen', False):
+        return
+    exe = sys.executable
+    try:
+        out = subprocess.check_output(
+            ['netsh', 'advfirewall', 'firewall', 'show', 'rule',
+             f'name=all', 'dir=in', 'verbose=on'],
+            text=True, timeout=10, stderr=subprocess.DEVNULL)
+    except Exception:
+        return
+
+    has_allow = False
+    deny_names = []
+    cur_name = None
+    cur_action = None
+    cur_program = None
+    for raw in out.splitlines():
+        line = raw.strip()
+        if line.startswith(('Rule Name:', '规则名称:')):
+            # 处理上一条完整记录
+            if cur_name and cur_program and exe.lower() in cur_program.lower():
+                if cur_action and 'allow' in cur_action.lower():
+                    has_allow = True
+                elif cur_action and ('block' in cur_action.lower() or 'deny' in cur_action.lower()):
+                    deny_names.append(cur_name)
+            cur_name = line.split(':', 1)[1].strip()
+            cur_action = None
+            cur_program = None
+        elif line.startswith(('Action:', '操作:')):
+            cur_action = line.split(':', 1)[1].strip()
+        elif line.startswith(('Program:', '程序:')):
+            cur_program = line.split(':', 1)[1].strip()
+    # 处理最后一条
+    if cur_name and cur_program and exe.lower() in cur_program.lower():
+        if cur_action and 'allow' in cur_action.lower():
+            has_allow = True
+        elif cur_action and ('block' in cur_action.lower() or 'deny' in cur_action.lower()):
+            deny_names.append(cur_name)
+
+    if has_allow:
+        return  # 已放行，无需操作
+    for name in deny_names:
+        try:
+            subprocess.run(
+                ['netsh', 'advfirewall', 'firewall', 'delete', 'rule', f'name={name}'],
+                capture_output=True, timeout=5)
+            logging.info('feed firewall: 已删除拒绝规则 "%s"，Windows 将重新弹窗询问', name)
+        except Exception as e:
+            logging.error('feed firewall: 删除规则失败 %s', e)
+
+
 # 子进程实际执行的代码：独立进程只服务 0.0.0.0:FEED_PORT。
 # 端口被占（如 dev 热重载时旧 feed 进程尚未退出）→ 自重试接管。
 _FEED_CHILD_CODE = f"""
@@ -4049,6 +4108,7 @@ def start_feed_server():
             logging.error("start_feed_server: 读取 feed_enabled 失败 %s", e)
             return
         if getattr(sys, 'frozen', False):
+            _ensure_feed_firewall()  # 清理旧的 deny 规则，让 Windows 重新弹窗
             def _run():
                 try:
                     app.run(host='0.0.0.0', port=FEED_PORT, debug=False, use_reloader=False)
