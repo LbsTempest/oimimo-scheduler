@@ -99,19 +99,85 @@ UPLOAD_RECEIPT_DIR = os.path.join(UPLOAD_DIR, 'receipt')  # Spec 23（小票主�
 # ═══════════════════════════════════════════════════════════
 
 # #41 当前应用版本（发版时与上传版 CHANGELOG/installer.iss/git tag 保持一致）
-APP_VERSION = '1.4.0'  # 定版 1.40：功能冻结，进入打包验证
+APP_VERSION = '1.5.0'  # Spec33 定版：枚举编码化（数据库格式不可逆变更，minor 级）
 # #41 上传版 GitHub 仓库（前端直连其 Releases API 检测新版本）
 GITHUB_REPO = 'mimo9708/oimimo-scheduler'
 
-STAGE_CLASS_MAP = {
-    '待开始': 'pending', '色稿': 'sketch', '线稿': 'lineart',
-    '细化': 'detail', '收尾': 'finish', '完成': 'completed', '退单': 'cancelled'
-}
+# Spec 33 卡 161：五份映射收敛为一份（§5.6）
+# stage_class 改走 enum_code_or_raw，删 STAGE_CLASS_MAP / STAGE_LABEL_TO_SLUG
 
 @app.template_filter('stage_class')
 def stage_class(stage_name):
-    """将阶段名称转为 CSS class 名"""
-    return STAGE_CLASS_MAP.get(stage_name, 'pending')
+    """将阶段值转为 CSS class 名（code 空间 → stage-xxx）"""
+    code = db.enum_code_or_raw('stage', stage_name)
+    return 'stage-' + code.replace('_', '-')
+
+
+# ── Spec 33 卡 161：6 过滤器 + 8 Jinja 测试 ──
+
+@app.template_filter('stage_label')
+def stage_label(v):
+    return db.enum_label('stage', v)
+
+@app.template_filter('ddl_label')
+def ddl_label(v):
+    return db.enum_label('ddl', v)
+
+@app.template_filter('payment_label')
+def payment_label(v):
+    return db.enum_label('payment', v)
+
+@app.template_filter('source_label')
+def source_label(v):
+    return db.choice_label('source', v) if v else v
+
+@app.template_filter('commission_label')
+def commission_label(v):
+    return db.choice_label('commission_type', v) if v else v
+
+@app.template_filter('enum_label')
+def enum_label_filter(v, kind='stage'):
+    return db.enum_label(kind, v)
+
+
+@app.template_filter('stage_code')
+def stage_code_filter(v):
+    """归一化阶段值到 code（兼容中文旧值与 code 新值）。"""
+    return db.enum_code_or_raw('stage', v)
+
+
+@app.template_test('done_stage')
+def _test_done_stage(v):
+    return db.is_done_stage(v)
+
+@app.template_test('refund_stage')
+def _test_refund_stage(v):
+    return db.is_refund_stage(v)
+
+@app.template_test('terminal_stage')
+def _test_terminal_stage(v):
+    return db.is_terminal_stage(v)
+
+@app.template_test('overdue_ddl')
+def _test_overdue_ddl(v):
+    return db.is_overdue_ddl(v)
+
+@app.template_test('due_ddl')
+def _test_due_ddl(v):
+    return db.enum_code_or_raw('ddl', v) == 'due'
+
+@app.template_test('paid_status')
+def _test_paid_status(v):
+    return db.enum_code_or_raw('payment', v) in db.get_paid_statuses()
+
+@app.template_test('archive_paid_status')
+def _test_archive_paid_status(v):
+    return db.enum_code_or_raw('payment', v) in db.get_archive_paid_statuses()
+
+@app.template_test('platform_source')
+def _test_platform_source(v):
+    """卡 169 D-2：入参 code 与中文标签都认（模板两处写法并存），判断集合是 code。"""
+    return (db.resolve_choice_code('source', v) or v) in db.get_platform_source_codes()
 
 
 @app.template_filter('price_fmt')
@@ -257,11 +323,6 @@ def _sanitize_theme_css(css: str):
     return css, None
 
 
-# #45 R2：阶段中文标签 → CSS slug（与 db.py stage_class 过滤器对齐）
-STAGE_LABEL_TO_SLUG = {'待开始': 'pending', '色稿': 'sketch', '线稿': 'lineart',
-                       '细化': 'detail', '收尾': 'finish', '完成': 'completed', '退单': 'cancelled'}
-
-
 # Spec 32 D1：深色主题判定阈值（theme_bg 相对亮度低于此值判深）
 _DARK_LUMINANCE_THRESHOLD = 0.35
 
@@ -346,10 +407,13 @@ def _build_theme_css(settings: dict) -> str:
         # hover 向对比极混合 15%：深 accent 提亮、浅 accent 压暗，双主题均产生可见变化
         lines.append("    --color-accent-hover: color-mix(in srgb, "
                      f"{_accent} 85%, {_accent_text} 15%);")
-    # #45 R2：阶段色统一由「着色模式·按阶段」面板管理。
-    # 读取链：cal_stage_<中文> > 旧 stage_<slug>（老用户存量值）> app.css 内置默认
-    for _label, _slug in STAGE_LABEL_TO_SLUG.items():
-        _val = settings.get(f'cal_stage_{_label}') or settings.get(f'stage_{_slug}')
+    # #45 R2 → Spec33 卡 161：阶段色统一由「着色模式·按阶段」面板管理。
+    # 读取链：cal_stage_<code> > cal_stage_<中文>（旧库兜底） > 旧 stage_<slug> > app.css 内置默认
+    # 卡 169 D-3：code 必须优先——M8 已把用户配色换键到 code 后缀，中文键只会是
+    # 旧版默认值复活出来的，中文优先等于拿默认色盖掉用户自定色。
+    for _code, _label in db.CODE_TO_LABEL.get('stage', {}).items():
+        _slug = _code.replace('_', '-')
+        _val = settings.get(f'cal_stage_{_code}') or settings.get(f'cal_stage_{_label}') or settings.get(f'stage_{_slug}')
         if _val:
             lines.append(f"    --stage-{_slug}: {_val};")
             lines.append(f"    --stage-{_slug}-bg: color-mix(in srgb, {_val} 12%, transparent);")
@@ -436,6 +500,30 @@ def merge_shortcuts(settings):
     return merged
 
 
+def _enum_choices_with_labels(kind):
+    """系统枚举 choices → [{code, label}]，含 auto-discover 值直通。"""
+    items = db.enum_items(kind)
+    codes = {i['code'] for i in items}
+    for v in db.get_choices(kind):
+        if v not in codes:
+            items.append({'code': v, 'label': v})
+            codes.add(v)
+    return items
+
+
+def _user_choices_with_labels(kind):
+    """用户枚举（source/commission_type）choices → [{code, label}]。
+
+    卡 168：模板一律拿 {code, label} 双写——`value` 用 code（提交/筛选值），
+    显示用 label（永远是中文）。缺 code/label 的历史行互相兜底，不产出空串。
+    """
+    out = []
+    for r in db.get_user_choice_items(kind):
+        code, label = r.get('code') or '', r.get('label') or ''
+        out.append({'code': code or label, 'label': label or code})
+    return out
+
+
 @app.context_processor
 def inject_constants():
     settings = {}
@@ -443,30 +531,46 @@ def inject_constants():
         settings = db.get_all_settings()
     except Exception:
         pass
-    # 从已取回的 settings 直接派生来源列表/平台集合，避免 get_source_list()/get_platform_sources()
-    # 动态选择列表：统一从 db.get_choices() 读取
-    source_list = db.get_choices('source')
-    raw_platforms = settings.get('platform_sources', '米画师,B站工坊,画加')
-    platform_sources = {x.strip() for x in raw_platforms.split(',') if x.strip()} \
-        or {'米画师', 'B站工坊', '画加'}
+    platform_sources = db.get_platform_sources() or set()
+    # Spec 33 卡 161：系统枚举 choices → [{code, label}] 对象
+    stage_choices = _enum_choices_with_labels('stage')
+    ddl_choices = _enum_choices_with_labels('ddl')
+    payment_choices = _enum_choices_with_labels('payment')
+    # Spec 33 卡 168：用户枚举同样 {code, label} 双写（模板不再裸出 code）
+    source_choices = _user_choices_with_labels('source')
+    commission_choices = _user_choices_with_labels('commission_type')
+    # Spec 33 卡 161：ENUM_JSON 供前端 JS 翻译
+    enum_json = {
+        'stage': db.CODE_TO_LABEL.get('stage', {}),
+        'ddl': db.CODE_TO_LABEL.get('ddl', {}),
+        'payment': db.CODE_TO_LABEL.get('payment', {}),
+    }
     return {
-        'STAGE_CHOICES': db.get_choices('stage'),
-        'STAGE_FLOWS': db.get_stage_flows(),  # Spec12 阶段流程预设（表单下拉/编辑器用）
-        'SOURCE_CHOICES': source_list,
-        'DDL_CHOICES': db.get_choices('ddl'),
-        'PAYMENT_CHOICES': db.get_choices('payment'),
-        'COMMISSION_TYPE_CHOICES': db.get_choices('commission_type'),
-        'STAGE_CLASS_MAP': STAGE_CLASS_MAP,
+        'STAGE_CHOICES': stage_choices,
+        'DDL_CHOICES': ddl_choices,
+        'PAYMENT_CHOICES': payment_choices,
+        'SOURCE_CHOICES': source_choices,
+        'COMMISSION_TYPE_CHOICES': commission_choices,
+        'STAGE_FLOWS': db.get_stage_flows(),
         'PLATFORM_SOURCES': platform_sources,
-        'DEFAULT_FEES': db.get_default_fees_map(),  # #43：表单选平台后自动填入默认费率
+        'PLATFORM_CODES': db.get_platform_source_codes(),
+        'DEFAULT_FEES': db.get_default_fees_map(),
+        'ENUM_LABELS': enum_json,
+        'ENUM_JSON': enum_json,
+        'refund_stage_code': db.get_refund_stage,
+        'unpaid_status_code': lambda: 'unpaid',
+        'pending_stage_code': lambda: 'pending',
         'theme_css': _build_theme_css(settings),
         'settings': settings,
         'shortcuts': merge_shortcuts(settings),
         'SHORTCUT_LABELS': SHORTCUT_LABELS,
         'APP_VERSION': APP_VERSION,
         'GITHUB_REPO': GITHUB_REPO,
-        # P20c：时薪功能全局保险丝（'1'/'0'，缺省视为开）
         'hourly_rate_enabled': settings.get('hourly_rate_enabled', '1') == '1',
+        # Spec 33 D12：迁移引擎失败时写 settings 键 enum_migration_failed='1'，
+        # 兼容模式静默启动会让金额与统计悄悄算错 → 全站横幅显式告知。
+        # 复用上面已取的 settings，不额外查库。
+        'migration_failed': settings.get('enum_migration_failed') == '1',
     }
 
 
@@ -599,13 +703,13 @@ def calendar_view():
     unscheduled = db.get_unscheduled_orders()
     # #45 R1：URL 显式 ?color= 优先（分享/书签），否则读用户偏好，最后回落按来源
     color_mode = request.args.get('color') or db.get_all_settings().get('calendar_color_mode', 'source')
-    # P13b F1 级联筛选：维度 → 值列表
+    # P13b F1 级联筛选：维度 → 值列表（卡 168：统一 {code,label}，value=code 显示=中文）
     filter_options = {
-        'stage': db.get_choices('stage'),
-        'source': db.get_choices('source'),
-        'commission_type': db.get_choices('commission_type'),
-        'customer': [{'id': c['id'], 'name': c['name']} for c in db.list_customers()],
-        'payment_status': db.get_choices('payment_status'),
+        'stage': _enum_choices_with_labels('stage'),
+        'source': _user_choices_with_labels('source'),
+        'commission_type': _user_choices_with_labels('commission_type'),
+        'customer': [{'code': c['id'], 'label': c['name']} for c in db.list_customers()],
+        'payment_status': _enum_choices_with_labels('payment'),
     }
     return render_template('calendar.html', unscheduled=unscheduled, color_mode=color_mode,
                            filter_options=filter_options)
@@ -613,7 +717,7 @@ def calendar_view():
 
 @app.route('/orders')
 def orders_list():
-    filters = {
+    filters = _normalize_enum_filters({
         'stage': request.args.get('stage'),
         'source': request.args.get('source'),
         'status': request.args.get('status'),
@@ -624,7 +728,7 @@ def orders_list():
         'per_page': _safe_int(request.args.get('per_page'), 30),
         'sort': request.args.get('sort'),
         'dir': request.args.get('dir'),
-    }
+    })
     # 移除 None 值
     filters = {k: v for k, v in filters.items() if v is not None and v != ''}
     if 'archived' not in filters:
@@ -709,30 +813,14 @@ def payments_panel(order_id):
 
 
 def _get_existing_values():
-    """获取已有的来源和品类列表（供 datalist 使用）"""
-    # 来源优先从设置读取
-    sources = db.get_source_list()
-    # 也合并数据库中已有的来源
-    conn = db.get_db()
-    db_sources = [r[0] for r in conn.execute(
-        "SELECT DISTINCT source FROM orders WHERE source IS NOT NULL AND source != '' ORDER BY source"
-    ).fetchall()]
-    for s in db_sources:
-        if s not in sources:
-            sources.append(s)
-    types = [r[0] for r in conn.execute(
-        "SELECT DISTINCT commission_type FROM orders WHERE commission_type IS NOT NULL AND commission_type != '' ORDER BY commission_type"
-    ).fetchall()]
-    # 合并设置中预设的稿件类别
-    try:
-        raw_types = db.get_all_settings().get('commission_type_list', '')
-        preset_types = [x.strip() for x in raw_types.split(',') if x.strip()]
-        for t in preset_types:
-            if t not in types:
-                types.append(t)
-    except Exception:
-        pass
-    conn.close()
+    """获取已有的来源和品类**显示名**列表（供 datalist 使用）。
+
+    卡 168：改读 choice_items（含 auto-discover 补建的行），不再直接 SELECT orders
+    ——orders 里现在存的是 code，直出会把英文码塞进 datalist；用户输入的中文名由
+    models 的归一化器换成 code 或当场建行，所以这里只给中文。
+    """
+    sources = [r['label'] for r in db.get_user_choice_items('source') if r.get('label')]
+    types = [r['label'] for r in db.get_user_choice_items('commission_type') if r.get('label')]
     return sources, types
 
 
@@ -1643,12 +1731,12 @@ def gallery_view():
 @app.route('/api/gallery')
 def api_gallery():
     """画廊分页接口（P13c）：offset/limit 分批 + 4 个筛选参数服务端化"""
-    filters = {
+    filters = _normalize_enum_filters({
         'stage': request.args.get('stage'),
         'source': request.args.get('source'),
         'customer': request.args.get('customer'),
         'type': request.args.get('type'),
-    }
+    })
     filters = {k: v for k, v in filters.items() if v}
     try:
         offset = max(0, int(request.args.get('offset', 0)))
@@ -1664,6 +1752,7 @@ def api_gallery():
             'title': o['project_name'],
             'customer': o['customer_name'],
             'stage': o['current_stage'],
+            'stage_label': db.enum_label('stage', o['current_stage']),
             'income': o['income'],
         } for o in items],
         'total': total,
@@ -2105,8 +2194,8 @@ NL_INTENT_MAP = [
     (r'下单次数|购买次数',       {'column': 'purchase_count', 'source': 'customers', 'agg': 'COUNT'}),
     (r'收入|总额|总收入|金额',  {'agg': 'SUM'}),
     # ── 订单状态过滤 ──
-    (r'已结算|完成',            {'filters': {'current_stage': '完成'}}),
-    (r'退单|取消|退款',         {'filters': {'current_stage': '退单'}}),
+    (r'已结算|完成',            {'filters': {'current_stage': 'completed'}}),
+    (r'退单|取消|退款',         {'filters': {'current_stage': 'cancelled'}}),
     (r'活跃|进行中|在制',       {'filters': {'is_archived': '0'}}),
     # ── 收款方式过滤 ──
     (r'分期',                   {'filters': {'payment_mode': 'installment'}}),
@@ -2230,9 +2319,9 @@ def _nl_build_human_desc(cfg: dict, warnings: list) -> str:
     else:
         flt = cfg.get('filters', {})
         stage = flt.get('current_stage')
-        if stage == '完成':
+        if db.is_done_stage(stage):
             parts.append('已结算订单')
-        elif stage == '退单':
+        elif db.is_refund_stage(stage):
             parts.append('退单订单')
         elif flt.get('is_archived') == '0':
             parts.append('活跃订单')
@@ -2282,14 +2371,54 @@ def stats_lab_page():
         abort(404)
 
 
+def _stats_lab_localize_rows(group_by: str, rows: list) -> list:
+    """Spec33 卡 166：把 group_by 列的 code 值翻译为中文 label（单一 helper，query/export 共用）。
+    _stats_lab_build_sql 不动（SQL 纯），只在路由层后处理。"""
+    if not group_by or not rows:
+        return rows
+    _KIND = {'stage': 'stage', 'source': 'source', 'category': 'commission_type',
+             'payment_status': 'payment', 'ddl_status': 'ddl'}
+    kind = _KIND.get(group_by)
+    if not kind:
+        return rows
+    for row in rows:
+        v = row.get(group_by)
+        if v and isinstance(v, str):
+            if kind in ('source', 'commission_type'):
+                row[group_by] = db.choice_label(kind, v) or v
+            else:
+                row[group_by] = db.enum_label(kind, v)
+    return rows
+
+
+def _stats_lab_normalize_filters(cfg: dict) -> dict:
+    """Spec33 卡 166 T166.6：stats-lab filters 入参归一（旧中文值与 code 同结果）。"""
+    if not isinstance(cfg, dict):
+        return cfg
+    filters = cfg.get('filters')
+    if not isinstance(filters, dict):
+        return cfg
+    _FIELD_KIND = {'current_stage': 'stage', 'ddl_status': 'ddl', 'payment_status': 'payment',
+                   'source': 'source', 'commission_type': 'commission_type'}
+    for field, kind in _FIELD_KIND.items():
+        if field in filters and isinstance(filters[field], str):
+            if kind in ('source', 'commission_type'):
+                filters[field] = db.resolve_choice_code(kind, filters[field]) or filters[field]
+            else:
+                filters[field] = db.enum_code_or_raw(kind, filters[field])
+    return cfg
+
+
 @app.post('/api/stats-lab/query')
 def stats_lab_query():
-    """白名单查询构建器执行（JSON → 参数化 SQL；响应附 sql/params 供公式预览与调试）。"""
+    """白名单查询构建器执行（JSON → 参数化 SQL；响应附 sql/params 供公式预览与调试）。
+    Spec33 卡 166：filters 入参归一 + rows 出参中文化。"""
     if not _stats_lab_enabled():
         return jsonify({'success': False, 'error': '统计实验室未启用'}), 404
     if not _is_local_origin():
         return jsonify({'success': False, 'error': '来源校验失败'}), 403
     cfg = request.get_json(silent=True)
+    cfg = _stats_lab_normalize_filters(cfg)  # T166.6
     try:
         sql, params = _stats_lab_build_sql(cfg)
     except ValueError as e:
@@ -2302,6 +2431,7 @@ def stats_lab_query():
         return jsonify({'success': False, 'error': '查询执行失败'}), 500
     finally:
         conn.close()
+    rows = _stats_lab_localize_rows((cfg or {}).get('group_by', ''), rows)  # T166.5
     return jsonify({'success': True, 'config': cfg, 'sql': sql,
                     'params': params, 'rows': rows})
 
@@ -2500,15 +2630,17 @@ def _archive_done_response(order_id):
 
 @app.post('/orders/<int:order_id>/stage')
 def update_order_stage(order_id):
-    new_stage = request.form['stage']
+    raw_stage = request.form['stage']
+    new_stage = db.enum_code_or_raw('stage', raw_stage)
     order = db.get_order(order_id)
     if not order:
         return jsonify({'error': '订单不存在'}), 404
     # Spec12：校验「本单快照阶段 + 退单」，而非全局 stage 选择列表
     # （自定义阶段名只在该订单快照中有效；快照外阶段拒绝，避免跨流程误切）
-    allowed = set(db.get_order_stage_names(order)) | {db.get_refund_stage()}
+    # Spec33 卡 163：归一化到 code 空间比较，兼容快照中中文或 code 值
+    allowed = {db.enum_code_or_raw('stage', n) for n in db.get_order_stage_names(order)} | {db.get_refund_stage()}
     if new_stage not in allowed:
-        return jsonify({'error': f'阶段「{new_stage}」不在本单流程中，请先在编辑页修改流程'}), 400
+        return jsonify({'error': f'阶段「{db.enum_label("stage", new_stage)}」不在本单流程中，请先在编辑页修改流程'}), 400
     db.update_stage(order_id, new_stage)
     order = db.get_order(order_id)
     resp = make_response(render_template('partials/kanban_card.html', order=order))
@@ -2894,7 +3026,7 @@ def api_stats_detail():
 
 @app.route('/api/orders')
 def api_orders():
-    filters = {
+    filters = _normalize_enum_filters({
         'stage': request.args.get('stage'),
         'source': request.args.get('source'),
         'status': request.args.get('status'),
@@ -2905,7 +3037,7 @@ def api_orders():
         'archived': request.args.get('archived', '0') == '1',
         'sort': request.args.get('sort'),
         'dir': request.args.get('dir'),
-    }
+    })
     filters = {k: v for k, v in filters.items() if v is not None and v != ''}
     if 'archived' not in filters:
         filters['archived'] = False
@@ -2943,10 +3075,31 @@ def api_gantt_data():
     return jsonify(db.get_orders_for_gantt())
 
 
+def _normalize_enum_filters(filters: dict) -> dict:
+    """Spec33 卡 164：归一化筛选 dict 中的枚举值（旧中文书签与 code 同结果）。
+    系统枚举走 enum_code_or_raw，用户枚举走 resolve_choice_code，非枚举键直通。"""
+    _SYS = {'stage': 'stage', 'status': 'payment', 'payment_status': 'payment', 'ddl': 'ddl'}
+    _USR = {'source': 'source', 'commission_type': 'commission_type', 'type': 'commission_type'}
+    out = {}
+    for k, v in filters.items():
+        if not v or not isinstance(v, str):
+            out[k] = v
+            continue
+        if k in _SYS:
+            out[k] = db.enum_code_or_raw(_SYS[k], v)
+        elif k in _USR:
+            out[k] = db.resolve_choice_code(_USR[k], v) or v
+        else:
+            out[k] = v
+    return out
+
+
 def _calendar_filters_from_args():
-    """P13b F1：从 query string 读取级联筛选参数"""
-    keys = ('stage', 'source', 'commission_type', 'customer_id', 'payment_status')
-    return {k: v for k in keys if (v := request.args.get(k))}
+    """P13b F1：从 query string 读取级联筛选参数。
+    Spec33 卡 164：入口归一化——旧中文书签（?stage=完成）与 code（?stage=completed）同结果。"""
+    raw = {k: v for k in ('stage', 'source', 'commission_type', 'customer_id', 'payment_status')
+           if (v := request.args.get(k))}
+    return _normalize_enum_filters(raw)
 
 
 @app.route('/api/orders/calendar-events')
@@ -3145,71 +3298,50 @@ def settings_page():
     for _sys in (db.get_done_stage(), db.get_refund_stage()):
         if _sys not in _flow_stage_seen:
             _flow_stages.append(_sys)
-    # #42+#48+#50：source/commission 着色面板数据源必须与稿件类别/来源管理列表同步，
-    # 不再使用 get_choices 的 auto-discover（会从 orders 表拉回已重命名的旧值）。
-    # 追加：①有自定义颜色配置的孤儿值（保留颜色投资）②orders 表中仍活跃的孤儿值（防删除后丢失）
-    def _synced_labels(settings_key, choice_type, prefix):
-        """返回与管理列表同步的标签列表 + 有颜色配置或仍在 orders 中使用的孤儿值。"""
-        raw = all_settings.get(settings_key, '')
-        base = [x.strip() for x in raw.split(',') if x.strip()]
-        if not base:
-            base = db.get_choices(choice_type)  # 回退到注册表默认
-        base_set = set(base)
-        reg = db.CHOICE_REGISTRY.get(choice_type, {})
-        field = reg.get('field', '')
-        # 获取 orders 表中实际使用的值
-        active_values = set()
-        if field:
-            try:
-                conn = db.get_db()
-                rows = conn.execute(
-                    f"SELECT DISTINCT {field} FROM orders WHERE {field} IS NOT NULL AND {field} != ''"
-                ).fetchall()
-                conn.close()
-                active_values = {r[0] for r in rows}
-            except Exception:
-                pass
-        # ① 有自定义颜色配置 AND 仍在 orders 表中使用的孤儿值
-        for key in all_settings:
-            if key.startswith(prefix):
-                orphan = key[len(prefix):]
-                if orphan and orphan not in base_set and orphan in active_values:
-                    base.append(orphan)
-                    base_set.add(orphan)
-        # ② orders 表中仍活跃但不在管理列表中的孤儿值（防止用户删除后着色/管理区丢失）
-        for val in sorted(active_values):
-            if val and val not in base_set:
-                base.append(val)
-                base_set.add(val)
-        return base
-
-    custom_mode_labels = {
-        'source': _synced_labels('source_list', 'source', 'cal_source_'),
-        'commission': _synced_labels('commission_type_list', 'commission_type', 'cal_commission_'),
-        'stage': _flow_stages,
+    # 卡 168（spec §5.1）：source/commission 的着色面板与管理区共用 choice_items 同一份清单——
+    # 后缀一律 code（日历着色 / 平台勾选 / 费率 / 合并全在 code 空间），显示一律 label（永远中文）。
+    # 先各调一次 get_choices 让 auto-discover 把 orders 里的活跃值补建成行，再取清单。
+    db.get_choices('source')
+    db.get_choices('commission_type')
+    source_items = db.get_user_choice_items('source')
+    commission_items = db.get_user_choice_items('commission_type')
+    _stage_code_by_label = {v: k for k, v in db.CODE_TO_LABEL.get('stage', {}).items()}
+    custom_mode_items = {
+        # 卡 169 D-3：stage 行的 key 后缀也一律用 code —— 内置阶段的 code 就是流程里的
+        # name（pending/sketch/…），与主题读链（_build_theme_css code 优先）、M8 换键结果
+        # 三处对齐；自定义阶段名本身没有 code，仍以中文名作后缀，主题读链不消费它。
+        'stage': [{'code': s, 'label': db.enum_label('stage', s)} for s in _flow_stages],
+        'source': [{'code': r['code'], 'label': r['label']} for r in source_items],
+        'commission': [{'code': r['code'], 'label': r['label']} for r in commission_items],
     }
 
     cal_palettes = {}
     for mode in cal_modes:
         mid = mode['id']
         prefix = f'cal_{mid}_'
-        items = []
         defaults = default_palettes.get(mid, {})
-        labels = custom_mode_labels.get(mid) or list(defaults.keys())
-        for label in labels:
-            default_color = defaults.get(label, '#b0b0aa')
+        # ddl/payment 是系统枚举：按注册表 code 出中文标签（此前直出 code）
+        rows = custom_mode_items.get(mid) or [
+            {'code': c, 'label': db.enum_label(mid, c)} for c in defaults]
+        items = []
+        for row in rows:
+            code = row['code'] if isinstance(row, dict) else row
+            label = row['label'] if isinstance(row, dict) else row
+            # 卡 169 D-3：后缀一律 code（stage 内置行同此，见 custom_mode_items 注释）
+            key = f'{prefix}{code}'
+            default_color = (defaults.get(code)
+                             or defaults.get(_stage_code_by_label.get(code, ''))
+                             or '#b0b0aa')
             items.append({
-                'key': f'{prefix}{label}',
+                'key': key,
+                'code': code,
                 'label': label,
-                'value': all_settings.get(f'{prefix}{label}', default_color),
+                'value': all_settings.get(key, default_color),
                 'default': default_color,
             })
         cal_palettes[mid] = items
 
-    # #50：管理区与着色面板使用同一份同步列表，防止稿件类别/来源被删除后管理区为空
-    commission_labels = custom_mode_labels['commission']
-    source_labels = custom_mode_labels['source']
-    # #50：稿件类别/来源在订单中的使用计数，用于前端删除保护
+    # #50：稿件类别/来源在订单中的使用计数（按 code），用于前端删除保护
     commission_active_counts = {}
     source_active_counts = {}
     try:
@@ -3230,9 +3362,7 @@ def settings_page():
     except Exception as e:
         logging.error('统计订单使用计数失败: %s', e)
 
-    # 来源管理
-    source_list = db.get_source_list()
-    platform_sources = db.get_platform_sources()
+    # 来源管理（卡 168：清单/平台标记/费率一律取自 choice_items，不再读 settings 遗留键）
     font_size = all_settings.get('font_size', '16px')
     font_family = all_settings.get('font_family', 'system')
 
@@ -3257,12 +3387,10 @@ def settings_page():
                            groups=groups,
                            cal_modes=cal_modes,
                            cal_palettes=cal_palettes,
-                           commission_labels=commission_labels,
+                           commission_items=commission_items,
                            commission_active_counts=commission_active_counts,
-                           source_labels=source_labels,
+                           source_items=source_items,
                            source_active_counts=source_active_counts,
-                           source_list=source_list,
-                           platform_sources=platform_sources,
                            vip_discount_presets=db.get_vip_discount_presets(),  # Spec19
                            font_size=font_size,
                            font_family=font_family,
@@ -3299,50 +3427,51 @@ def save_settings():
         else:
             logging.warning('vip_discount_presets 保存跳过：无合法预设值（每项须 ∈ (0,100]）')
 
-    # 来源管理
+    # 来源/类别清单：提交的隐藏清单是**唯一事实源**（卡 168）——token 允许 code 或中文名，
+    # reconcile_choice_list 负责认旧名（改名）、补新名（建行）、删漏项（带 D9 引用保护）
+    source_tokens = None
     if 'source_list_input' in data:
-        data['source_list'] = data['source_list_input']
-        del data['source_list_input']
-    platform_keys = [k for k in data if k.startswith('platform_')]
-    platform_vals = [data[k] for k in platform_keys]
-    data['platform_sources'] = ','.join(platform_vals)
-    for k in platform_keys:
-        del data[k]
+        source_tokens = [x.strip() for x in data.pop('source_list_input').split(',') if x.strip()]
+    commission_tokens = None
+    if 'commission_type_list' in data:
+        commission_tokens = [x.strip() for x in data.pop('commission_type_list').split(',')
+                             if x.strip()]
+    # 平台勾选（platform_<x>）与默认费率（default_fee_<x>）不再是 settings 键，
+    # 转写 choice_items 的 is_platform / default_fee_pct 列
+    platform_tokens = [data.pop(k) for k in [k for k in data if k.startswith('platform_')]]
+    fee_map = {k[len('default_fee_'):]: data.pop(k)
+               for k in [k for k in data if k.startswith('default_fee_')]}
     # Spec 28 phase-14（task-132）：来源删除确认清单（D9 确认对话框产出，逗号分隔）
     confirmed_deletes = [x.strip() for x in
                          data.pop('confirmed_source_deletes', '').split(',') if x.strip()]
+    # 卡 168 T168.4：这四个键已由迁移引擎退役，任何来源的表单键都不许再落库
+    for _k in ('source_list', 'platform_sources', 'payment_status_list', 'commission_type_list'):
+        data.pop(_k, None)
 
     # Spec20 卡 86：开关开启且 token 为空 → 自动生成（32 位 hex），随下方事务落库
     if data.get('feed_enabled') == '1' and not data.get('feed_token') \
             and not db.get_all_settings().get('feed_token'):
         data['feed_token'] = secrets.token_hex(16)
 
-    # 重命名时同步更新 orders 表（收款状态已锁定，不需要同步）
-    # P19-F5：重命名 + settings 更新包同一事务，中途失败整体回滚
+    # 卡 168 T168.5：清单对齐 + 属性列写入 + 设置落库同事务（中途失败整体回滚）
     with db.transaction() as conn:
-        db.sync_choice_renames(conn, data, 'commission_type_list', 'commission_type')
-        renamed_src = db.sync_choice_renames(conn, data, 'source_list', 'source')
-        # Spec 28 phase-14（task-132）：来源删除处理（D9——被删来源有引用须确认，
-        # 确认后 orders.source 置空；未确认的被引用来源服务端保留防误删）
-        amended_list, amended_plats = db.apply_source_deletions(
-            conn, data.get('source_list'), data.get('platform_sources'), confirmed_deletes)
-        if amended_list is not None:
-            data['source_list'] = amended_list
-        if amended_plats is not None:
-            data['platform_sources'] = amended_plats
-        # task-133 实测修复：被删来源的 cal_source_ 输入在日历面板另一处 DOM，
-        # 不随来源项删除而移除，会在 update_settings 时复活刚清理的键——
-        # 按最终 source_list 剔除孤儿 cal_source_/default_fee_ 表单键（顺带清旧孤儿）
-        _final_sources = {x for x in (data.get('source_list') or '').split(',') if x}
-        for _k in [k for k in data
-                   if k.startswith(('cal_source_', 'default_fee_'))
-                   and k.split('_', 2)[2] not in _final_sources
-                   and k.split('_', 2)[2]]:
-            del data[_k]
+        if commission_tokens is not None:
+            db.reconcile_choice_list(conn, 'commission_type', commission_tokens, confirmed_deletes)
+        if source_tokens is not None:
+            db.reconcile_choice_list(conn, 'source', source_tokens, confirmed_deletes)
+        # 未勾选任何平台 = 提交空列表（原始清单在场即视为已提交），不能当成"未提交"跳过
+        db.set_source_platform_fees(
+            conn, platform_tokens if source_tokens is not None else None, fee_map)
+        # 日历着色面板是另一处独立 DOM：清单里已不存在的 code 的 cal_* 表单键要剔除，
+        # 否则 update_settings 会把刚清理的颜色键复活（task-133 实测坑）
+        for _kind, _prefix in (('source', 'cal_source_'),
+                               ('commission_type', 'cal_commission_')):
+            _live = {r[0] for r in conn.execute(
+                'SELECT code FROM choice_items WHERE kind=?', (_kind,)).fetchall()}
+            for _k in [k for k in data
+                       if k.startswith(_prefix) and k[len(_prefix):] not in _live]:
+                del data[_k]
         db.update_settings(data, conn=conn)
-        # P19-F9：来源重命名级联——新名称对应费率写入受影响订单快照并按快照重算（同事务）
-        for _old, (_new, _ids) in renamed_src.items():
-            db.resnapshot_fee_for_renamed_source(conn, _ids, _new)
     # Spec20：feed 开启即时生效（幂等，重复保存不双拉）；关闭需重启（spec §6 口径）
     if data.get('feed_enabled') == '1':
         start_feed_server()
@@ -3438,12 +3567,6 @@ def save_stage_flows_route():
     resp = jsonify({'success': True, 'count': len(flows)})
     resp.headers['HX-Trigger'] = json.dumps({'showToast': f'已保存 {len(flows)} 条流程预设（仅影响之后创建的订单）'})
     return resp
-
-
-def _sync_choices_to_orders(data, settings_key, order_field):
-    """兼容包装（P19-F5 起实现迁移至 db.sync_choice_renames；请优先在事务中调用后者）"""
-    with db.transaction() as conn:
-        return db.sync_choice_renames(conn, data, settings_key, order_field)
 
 
 @app.post('/settings/reset')
@@ -3688,12 +3811,13 @@ def delete_palette_preset():
 def export_orders_md():
     """导出全部订单为单个 Markdown 文件，写入 exports/全部订单.md（覆盖）。"""
     orders = db.get_all_orders()
-    platform_sources = db.get_platform_sources()  # 设置驱动，非 models.py 常量
+    # 卡 169 D-2：导出模板按 code 比来源（此前传中文标签集，o.source 是 code → 永不命中）
+    platform_codes = db.get_platform_source_codes()
     active = sum(1 for o in orders if not o['is_archived'])
     archived = len(orders) - active
     md = render_template('export/orders.md',
                          orders=orders,
-                         platform_sources=platform_sources,
+                         platform_codes=platform_codes,
                          exported_at=datetime.now().strftime('%Y-%m-%d %H:%M'),
                          active_count=active,
                          archived_count=archived)
@@ -3841,8 +3965,8 @@ def api_import_mihuashi():
     order_data = {
         'project_name': project_name,
         'platform_url': platform_url,
-        'source': '米画师',
-        'current_stage': '待开始',
+        'source': 'mihuashi',
+        'current_stage': 'pending',
         'deposit': price,
         'balance': 0,
         'commission_type': category if category else None,
@@ -3945,11 +4069,11 @@ def _build_ics(rows=None) -> str:
         else:
             lines.append(f"DTSTART;VALUE=DATE:{allday}")
             lines.append(f"DTEND;VALUE=DATE:{allday_end}")
-        summary = f"[{o.get('current_stage') or '未定'}] {o.get('project_name') or '未命名'}"
+        summary = f"[{db.enum_label('stage', o.get('current_stage')) or '未定'}] {o.get('project_name') or '未命名'}"
         if o.get('customer_name'):
             summary += f" · {o['customer_name']}"
         lines.append(f"SUMMARY:{_ics_escape(summary)}")
-        desc = f"来源 {o.get('source') or '-'} · 实收 {float(o.get('actual_received') or 0):.2f}"
+        desc = f"来源 {db.choice_label('source', o.get('source')) or '-'} · 实收 {float(o.get('actual_received') or 0):.2f}"
         notes = str(o.get('notes') or '').strip()[:100]
         if notes:
             desc += f" · {notes}"

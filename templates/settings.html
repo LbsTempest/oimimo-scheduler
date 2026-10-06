@@ -209,20 +209,20 @@
             <div class="card-header has-tip">来源管理<span class="tip-trigger">?<span class="header-tip">勾选「平台」的来源会在订单中显示手续费计算，未勾选的来源不计算手续费（直接收全款）。<br>注意：费率与「平台」勾选仅对之后新建的订单生效；已有订单的手续费按下单时的快照计算，不会随设置变更而回溯。如需已有订单免手续费，请编辑该订单并将手续费率改为 0。</span></span></div>
             <div class="card-body">
                 <div style="display:grid;grid-template-columns:repeat(auto-fill, minmax(280px, 1fr));gap:var(--space-sm);">
-                    {% for src in source_labels %}
-                    {% set is_plat = src in platform_sources %}
-                    {% set def_fee = all_settings.get('default_fee_' + src, '5') %}
-                    {% set src_count = source_active_counts.get(src, 0) %}
-                    <div class="source-item" data-name="{{ src }}" style="display:flex;align-items:center;gap:var(--space-sm);padding:10px 14px;border:1px solid var(--color-border);border-radius:var(--radius-sm);">
-                        <span style="flex:1;font-weight:500;min-width:60px;">{{ src }}{% if src_count > 0 %}<span style="font-size:0.7rem;color:var(--color-text-tertiary);margin-left:2px;" title="被 {{ src_count }} 个订单使用">({{ src_count }})</span>{% endif %}</span>
+                    {% for it in source_items %}
+                    {% set src_code = it.code %}
+                    {% set src_label = it.label %}
+                    {% set src_count = source_active_counts.get(src_code, 0) %}
+                    <div class="source-item" data-name="{{ src_code }}" data-label="{{ src_label }}" style="display:flex;align-items:center;gap:var(--space-sm);padding:10px 14px;border:1px solid var(--color-border);border-radius:var(--radius-sm);">
+                        <span style="flex:1;font-weight:500;min-width:60px;">{{ src_label }}{% if src_count > 0 %}<span style="font-size:0.7rem;color:var(--color-text-tertiary);margin-left:2px;" title="被 {{ src_count }} 个订单使用">({{ src_count }})</span>{% endif %}</span>
                         <label style="display:flex;align-items:center;gap:4px;font-size:0.78rem;cursor:pointer;white-space:nowrap;">
-                            <input type="checkbox" name="platform_{{ src }}" value="{{ src }}"
-                                   {% if is_plat %}checked{% endif %} onchange="toggleFeeInput(this)"
+                            <input type="checkbox" name="platform_{{ src_code }}" value="{{ src_code }}"
+                                   {% if it.is_platform %}checked{% endif %} onchange="toggleFeeInput(this)"
                                    style="width:15px;height:15px;cursor:pointer;"> 平台
                         </label>
-                        <input type="number" name="default_fee_{{ src }}" value="{{ def_fee }}"
+                        <input type="number" name="default_fee_{{ src_code }}" value="{{ '%g'|format(it.default_fee_pct if it.default_fee_pct is not none else 5) }}"
                                step="0.5" min="0" max="100"
-                               style="width:52px;padding:3px 5px;border:1px solid var(--color-border);border-radius:3px;font-size:0.78rem;text-align:center;{% if not is_plat %}display:none;{% endif %}"
+                               style="width:52px;padding:3px 5px;border:1px solid var(--color-border);border-radius:3px;font-size:0.78rem;text-align:center;{% if not it.is_platform %}display:none;{% endif %}"
                                class="fee-input">
                         <span style="font-size:0.72rem;color:var(--color-text-tertiary);">%</span>
                         <button type="button" class="settings-tag-remove source-del-btn" onclick="removeSourceTag(this)" title="{% if src_count > 0 %}被 {{ src_count }} 个订单使用，删除后订单来源置空{% else %}删除{% endif %}">×</button>
@@ -234,7 +234,7 @@
                     <div style="display:flex;gap:var(--space-sm);margin-top:6px;">
                         <input type="text" id="new-source-name" placeholder="输入来源名称"
                                style="flex:1;padding:8px 12px;border:1px solid var(--color-border);border-radius:var(--radius-sm);font-size:0.88rem;">
-                        <input type="hidden" name="source_list_input" id="source-list-hidden" value="{{ source_labels|join(',') }}">
+                        <input type="hidden" name="source_list_input" id="source-list-hidden" value="{{ source_items|map(attribute='code')|join(',') }}">
                         <input type="hidden" name="confirmed_source_deletes" id="confirmed-source-deletes" value="">
                         <button type="button" class="btn btn-primary btn-sm" onclick="addSource()" style="white-space:nowrap;">+ 添加</button>
                     </div>
@@ -276,7 +276,7 @@
             <div class="card-body">
                 <div style="display:flex;flex-wrap:wrap;gap:6px;">
                     {% for ps in PAYMENT_CHOICES %}
-                    <span class="settings-tag">{{ ps }}</span>
+                    <span class="settings-tag">{{ ps.label }}</span>
                     {% endfor %}
                 </div>
             </div>
@@ -286,10 +286,10 @@
             <div class="card-header has-tip">稿件类别管理<span class="tip-trigger">?<span class="header-tip">自定义稿件类别。修改后订单表单中的类别下拉将同步更新。</span></span></div>
             <div class="card-body">
                 <div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:var(--space-md);" id="commission-type-tags">
-                    {% for ct in commission_labels %}
-                    {% if ct %}
-                    {% set ct_count = commission_active_counts.get(ct, 0) %}
-                    <span class="settings-tag commission-tag" data-name="{{ ct }}">{{ ct }}{% if ct_count > 0 %}<span style="font-size:0.7rem;color:var(--color-text-tertiary);margin-left:2px;" title="被 {{ ct_count }} 个订单使用">({{ ct_count }})</span>{% endif %}<button type="button" class="settings-tag-remove" onclick="removeCommissionTag(this)" title="{% if ct_count > 0 %}被 {{ ct_count }} 个订单使用，无法删除{% else %}删除{% endif %}">×</button></span>
+                    {% for it in commission_items %}
+                    {% if it.code %}
+                    {% set ct_count = commission_active_counts.get(it.code, 0) %}
+                    <span class="settings-tag commission-tag" data-name="{{ it.code }}" data-label="{{ it.label }}">{{ it.label }}{% if ct_count > 0 %}<span style="font-size:0.7rem;color:var(--color-text-tertiary);margin-left:2px;" title="被 {{ ct_count }} 个订单使用">({{ ct_count }})</span>{% endif %}<button type="button" class="settings-tag-remove" onclick="removeCommissionTag(this)" title="{% if ct_count > 0 %}被 {{ ct_count }} 个订单使用，无法删除{% else %}删除{% endif %}">×</button></span>
                     {% endif %}
                     {% endfor %}
                 </div>
@@ -297,7 +297,7 @@
                     <input type="text" id="new-commission-name" placeholder="输入新稿件类别名称"
                            style="flex:1;padding:8px 12px;border:1px solid var(--color-border);border-radius:var(--radius-sm);font-size:0.88rem;"
                            onkeydown="if(event.key==='Enter'){addCommissionTag();event.preventDefault();}">
-                    <input type="hidden" name="commission_type_list" id="commission-type-hidden" value="{{ commission_labels|join(',') }}">
+                    <input type="hidden" name="commission_type_list" id="commission-type-hidden" value="{{ commission_items|map(attribute='code')|join(',') }}">
                     <button type="button" class="btn btn-primary btn-sm" onclick="addCommissionTag()" style="white-space:nowrap;">+ 添加</button>
                 </div>
                 <!-- 类别合并 -->
@@ -846,10 +846,7 @@ var PRESET_CSS_MAP = {
     'stage_cancelled': '--stage-cancelled',
 };
 
-// #45 R2：「阶段色」input 已从全局主题色移除，预设里的 stage_<slug> 改写入「着色模式·按阶段」面板的 cal_stage_<中文> input
-var SLUG_TO_LABEL = {'pending': '待开始', 'sketch': '色稿', 'lineart': '线稿',
-                     'detail': '细化', 'finish': '收尾', 'completed': '完成', 'cancelled': '退单'};
-
+// Spec33 卡 163：code=slug 塌缩后，cal_stage_<slug> 直接可用，删 SLUG_TO_LABEL
 // 应用预设主题（写入下方隐藏 input + 色块预览 + 实时预览 CSS 变量）
 function applyPreset(presetId) {
     var preset = PRESET_DATA[presetId];
@@ -861,11 +858,10 @@ function applyPreset(presetId) {
     var root = document.documentElement;
 
     Object.keys(preset).forEach(function(key) {
-        // 1. 写入隐藏 input + 色块 trigger（#45 R2：stage_* 键映射到 cal_stage_* input）
+        // 1. 写入隐藏 input + 色块 trigger（Spec33：stage_* 键直接映射 cal_stage_<slug>）
         var inputName = key;
         if (key.indexOf('stage_') === 0) {
-            var _lbl = SLUG_TO_LABEL[key.slice(6)];
-            if (_lbl) inputName = 'cal_stage_' + _lbl;
+            inputName = 'cal_stage_' + key.slice(6);
         }
         var input = form.querySelector('input[name="' + inputName + '"]');
         if (input) {
@@ -1044,50 +1040,54 @@ function switchTab(name) {
     if (name === 'system') renderErrorLogs();
 }
 
-// 稿件类别
-// #50：订单使用计数，用于删除保护
+// 稿件类别（卡 168：data-name=code 供合并/删除传参，data-label=中文供显示）
+// #50：订单使用计数（按 code），用于删除保护
 var _commissionActiveCounts = {{ commission_active_counts | tojson }};
+function _commissionTags() { return document.querySelectorAll('#commission-type-tags .commission-tag'); }
 function addCommissionTag() {
     var input = document.getElementById('new-commission-name');
     var name = input.value.trim(); if (!name) return;
     var container = document.getElementById('commission-type-tags');
-    var existing = container.querySelectorAll('.commission-tag');
+    var existing = _commissionTags();
     for (var i = 0; i < existing.length; i++) {
-        var en = existing[i].dataset.name || existing[i].textContent.replace('×','').replace(/\(\d+\)/, '').trim();
-        if (en === name) { showToast('已存在', 'error'); return; }
+        if ((existing[i].dataset.label || existing[i].dataset.name) === name) { showToast('已存在', 'error'); return; }
     }
     var tag = document.createElement('span');
     tag.className = 'settings-tag commission-tag';
+    // 新值还没有 code，先把中文名当 token 提交，保存时后端 reconcile 补建行
     tag.dataset.name = name;
+    tag.dataset.label = name;
     tag.innerHTML = escHtml(name) + '<button type="button" class="settings-tag-remove" onclick="removeCommissionTag(this)" title="删除">×</button>';
     container.appendChild(tag); input.value = ''; updateCommissionHidden();
 }
 function removeCommissionTag(btn) {
     var tag = btn.parentElement;
-    var name = tag.dataset.name || tag.textContent.replace('×','').replace(/\(\d+\)/, '').trim();
-    var cnt = _commissionActiveCounts[name] || 0;
+    var code = tag.dataset.name;
+    var label = tag.dataset.label || code;
+    if (!code) return;
+    var cnt = _commissionActiveCounts[code] || 0;
     if (cnt > 0) {
-        showToast('「' + name + '」仍被 ' + cnt + ' 个订单使用，无法删除。请先将相关订单改为其他类别。', 'error');
+        showToast('「' + label + '」仍被 ' + cnt + ' 个订单使用，无法删除。请先将相关订单改为其他类别。', 'error');
         return;
     }
     tag.remove(); updateCommissionHidden();
 }
 function updateCommissionHidden() {
-    var tags = document.querySelectorAll('#commission-type-tags .commission-tag');
-    var names = []; tags.forEach(function(t) { names.push(t.dataset.name || t.textContent.replace('×','').replace(/\(\d+\)/, '').trim()); });
+    var names = []; _commissionTags().forEach(function(t) { if (t.dataset.name) names.push(t.dataset.name); });
     document.getElementById('commission-type-hidden').value = names.join(',');
-    renderMergeCheckboxes(names);
+    renderMergeCheckboxes();
 }
-// 类别合并
-function renderMergeCheckboxes(names) {
+// 类别合并（卡 168：勾选框传 code，目标名是中文，由后端解析/建行）
+function renderMergeCheckboxes() {
     var box = document.getElementById('merge-checkboxes');
     if (!box) return;
     box.innerHTML = '';
-    (names || []).forEach(function(n) {
-        if (!n) return;
+    _commissionTags().forEach(function(t) {
+        var code = t.dataset.name, label = t.dataset.label || code;
+        if (!code) return;
         var lbl = document.createElement('label');
         lbl.style.cssText = 'display:inline-flex;align-items:center;gap:4px;font-size:0.82rem;padding:4px 8px;border:1px solid var(--color-border);border-radius:var(--radius-sm);cursor:pointer;';
-        lbl.innerHTML = '<input type="checkbox" class="merge-ct-cb" value="' + escHtml(n) + '"> ' + escHtml(n);
+        lbl.innerHTML = '<input type="checkbox" class="merge-ct-cb" value="' + escHtml(code) + '"> ' + escHtml(label);
         box.appendChild(lbl);
     });
 }
@@ -1097,7 +1097,7 @@ function doMergeCommission() {
     var newName = (document.getElementById('merge-target-name').value || '').trim();
     if (oldNames.length < 2) { showToast('请至少勾选 2 个类别', 'warning'); return; }
     if (!newName) { showToast('请输入合并后的目标名称', 'warning'); return; }
-    if (!confirm('确定将「' + oldNames.join('、') + '」合并为「' + newName + '」？\n此操作将更新所有相关订单，不可撤销。')) return;
+    if (!confirm('确定将所选 ' + oldNames.length + ' 个类别合并为「' + newName + '」？\n此操作将更新所有相关订单，不可撤销。')) return;
     fetch('/settings/commission-merge', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
@@ -1112,53 +1112,52 @@ function doMergeCommission() {
     }).catch(function() { showToast('网络错误', 'error'); });
 }
 // 初始化合并复选框（卡 156：并入末尾 window.__pageInit，由 app.js runPageInit 统一触发）
-function initCommissionMerge() {
-    var tags = document.querySelectorAll('#commission-type-tags .commission-tag');
-    var names = []; tags.forEach(function(t) { names.push(t.dataset.name || t.textContent.replace('×','').replace(/\(\d+\)/, '').trim()); });
-    renderMergeCheckboxes(names);
-}
+function initCommissionMerge() { renderMergeCheckboxes(); }
 
 // 来源管理
 function toggleFeeInput(cb) { cb.closest('.source-item').querySelector('.fee-input').style.display = cb.checked ? '' : 'none'; }
 // Spec 28 phase-14（task-133）：来源删除（D9 确认保护）+ 合并（D10）
+// 卡 168：data-name=code 供合并/删除传参，data-label=中文供显示
 var _sourceActiveCounts = {{ source_active_counts | tojson }};
+function _sourceItems() { return document.querySelectorAll('#panel-source .source-item'); }
 function removeSourceTag(btn) {
     var item = btn.closest('.source-item');
-    var name = item.dataset.name;
-    if (!name) return;
-    var cnt = _sourceActiveCounts[name] || 0;
+    var code = item.dataset.name;
+    var label = item.dataset.label || code;
+    if (!code) return;
+    var cnt = _sourceActiveCounts[code] || 0;
     if (cnt > 0 && !confirm('该来源被 ' + cnt + ' 个订单使用，删除后这些订单的来源将变为空。确认删除？')) return;
     if (cnt > 0) {
-        // D9：确认删除的被引用来源登记清单，保存时后端置空 orders.source
+        // D9：确认删除的被引用来源登记 code，保存时后端置空 orders.source
         var ch = document.getElementById('confirmed-source-deletes');
         var arr = ch.value ? ch.value.split(',') : [];
-        if (arr.indexOf(name) === -1) { arr.push(name); ch.value = arr.join(','); }
+        if (arr.indexOf(code) === -1) { arr.push(code); ch.value = arr.join(','); }
     }
     item.remove();
-    renderSourceMergeCheckboxes(updateSourceHidden());
-    showToast(cnt > 0 ? '已标记删除「' + name + '」，保存设置后相关订单来源将置空'
-                     : '已移除「' + name + '」，保存设置后生效', 'success');
+    updateSourceHidden();
+    showToast(cnt > 0 ? '已标记删除「' + label + '」，保存设置后相关订单来源将置空'
+                     : '已移除「' + label + '」，保存设置后生效', 'success');
 }
 function updateSourceHidden() {
     var list = [];
-    document.querySelectorAll('#panel-source .source-item').forEach(function(it) {
-        if (it.dataset.name) list.push(it.dataset.name);
-    });
+    _sourceItems().forEach(function(it) { if (it.dataset.name) list.push(it.dataset.name); });
     document.getElementById('source-list-hidden').value = list.join(',');
+    renderSourceMergeCheckboxes();
     return list;
 }
-function renderSourceMergeCheckboxes(names) {
+function renderSourceMergeCheckboxes() {
     var box = document.getElementById('source-merge-checkboxes');
     if (!box) return;
     box.innerHTML = '';
-    (names || []).forEach(function(n) {
-        if (!n) return;
+    _sourceItems().forEach(function(it) {
+        var code = it.dataset.name, label = it.dataset.label || code;
+        if (!code) return;
         var lbl = document.createElement('label');
         lbl.style.cssText = 'display:inline-flex;align-items:center;gap:4px;font-size:0.82rem;padding:4px 8px;border:1px solid var(--color-border);border-radius:var(--radius-sm);cursor:pointer;';
         var cb = document.createElement('input');
-        cb.type = 'checkbox'; cb.className = 'merge-src-cb'; cb.value = n;
+        cb.type = 'checkbox'; cb.className = 'merge-src-cb'; cb.value = code;
         cb.addEventListener('change', updateSourceMergeBtnState);
-        lbl.appendChild(cb); lbl.appendChild(document.createTextNode(' ' + n));
+        lbl.appendChild(cb); lbl.appendChild(document.createTextNode(' ' + label));
         box.appendChild(lbl);
     });
     updateSourceMergeBtnState();
@@ -1172,12 +1171,17 @@ function updateSourceMergeBtnState() {
 }
 function doMergeSources() {
     var oldNames = [];
-    document.querySelectorAll('.merge-src-cb:checked').forEach(function(cb) { oldNames.push(cb.value); });
+    var oldLabels = [];
+    document.querySelectorAll('.merge-src-cb:checked').forEach(function(cb) {
+        oldNames.push(cb.value);
+        var it = cb.closest('label');
+        if (it) oldLabels.push(it.textContent.trim());
+    });
     var newName = (document.getElementById('source-merge-target').value || '').trim();
     if (oldNames.length < 1) { showToast('请至少勾选 1 个来源', 'warning'); return; }
     if (!newName) { showToast('请输入合并后的目标名称', 'warning'); return; }
-    if (oldNames.indexOf(newName) !== -1) { showToast('目标名称不能与被合并来源相同', 'warning'); return; }
-    if (!confirm('确定将「' + oldNames.join('、') + '」合并为「' + newName + '」？\n此操作将更新所有相关订单与费率/颜色配置，不可撤销。')) return;
+    if (oldLabels.indexOf(newName) !== -1) { showToast('目标名称不能与被合并来源相同', 'warning'); return; }
+    if (!confirm('确定将「' + oldLabels.join('、') + '」合并为「' + newName + '」？\n此操作将更新所有相关订单与费率/颜色配置，不可撤销。')) return;
     fetch('/settings/source-merge', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
@@ -1193,8 +1197,7 @@ function doMergeSources() {
 }
 // 来源合并初始化（卡 156：并入末尾 window.__pageInit）
 function initSourceMerge() {
-    var hidden = document.getElementById('source-list-hidden');
-    renderSourceMergeCheckboxes(hidden && hidden.value ? hidden.value.split(',') : []);
+    renderSourceMergeCheckboxes();
     var tgt = document.getElementById('source-merge-target');
     if (tgt) tgt.addEventListener('input', updateSourceMergeBtnState);
 }
@@ -1227,6 +1230,11 @@ function updateVipPresetHidden() {
 var _stageFlows = {{ STAGE_FLOWS | tojson }};
 var _activeFlowIdx = 0;
 var _stageFlowStageCounter = 0;
+// Spec33 卡171：流程编辑器存 code、显示 label（沿卡168 表单模板模式）。
+// STAGE_LABEL_MAP: code→中文；STAGE_CODE_MAP: 中文→code（前端翻转，自定义名双向直通）。
+var STAGE_LABEL_MAP = {{ ENUM_LABELS.stage | tojson }};
+var STAGE_CODE_MAP = {};
+for (var _sk in STAGE_LABEL_MAP) { if (Object.prototype.hasOwnProperty.call(STAGE_LABEL_MAP, _sk)) STAGE_CODE_MAP[STAGE_LABEL_MAP[_sk]] = _sk; }
 
 function renderStageFlows() {
     var nav = document.getElementById('stage-flows-nav');
@@ -1282,8 +1290,10 @@ function _saveActiveCardToModel() {
     if (nameInp) _stageFlows[_activeFlowIdx].name = nameInp.value.trim();
     var stages = [];
     card.querySelectorAll('.stage-flow-row').forEach(function(r) {
+        var rawName = r.querySelector('.stage-name').value.trim();
         stages.push({
-            name: r.querySelector('.stage-name').value.trim(),
+            // Spec33 卡171：输入框显示中文，回存翻回 code（自定义名不在表中则原样）
+            name: STAGE_CODE_MAP[rawName] || rawName,
             progress: parseInt(r.querySelector('.stage-progress').value, 10) || 0
         });
     });
@@ -1326,7 +1336,7 @@ function buildStageFlowCard(flow, fi) {
     return card;
 }
 function buildStageRow(stage) {
-    var isAnchor = (stage.name === '待开始' || stage.name === '完成');
+    var isAnchor = (stage.name === 'pending' || stage.name === 'completed');
     var row = document.createElement('div');
     row.className = 'stage-flow-row' + (isAnchor ? ' is-anchor' : '');
     row.style.cssText = 'display:flex;gap:var(--space-sm);align-items:center;';
@@ -1343,7 +1353,8 @@ function buildStageRow(stage) {
     // 名称输入
     var nameInp = document.createElement('input');
     nameInp.type = 'text'; nameInp.className = 'stage-name';
-    nameInp.value = stage.name || ''; nameInp.placeholder = '阶段名称';
+    // Spec33 卡171：模型存 code，输入框显示中文（锚点也显示 待开始/完成；自定义名直通）
+    nameInp.value = STAGE_LABEL_MAP[stage.name] || stage.name || ''; nameInp.placeholder = '阶段名称';
     nameInp.style.cssText = 'flex:1;padding:6px 10px;border:1px solid var(--color-border);border-radius:var(--radius-sm);font-size:0.88rem;';
     if (isAnchor) { nameInp.readOnly = true; nameInp.style.background = 'var(--color-bg)'; nameInp.style.color = 'var(--color-text-secondary)'; }
     row.appendChild(nameInp);
@@ -1388,8 +1399,8 @@ function addStageFlow() {
     _stageFlows.push({
         name: '新流程',
         stages: [
-            {name: '待开始', progress: 0},
-            {name: '完成', progress: 100}
+            {name: 'pending', progress: 0},
+            {name: 'completed', progress: 100}
         ]
     });
     _activeFlowIdx = _stageFlows.length - 1;
@@ -1440,8 +1451,8 @@ function _collectStageFlows() {
                 showToast('流程「' + flow.name + '」阶段进度需严格递增', 'error'); _activeFlowIdx = i; renderStageFlows(); return null;
             }
         }
-        if (flow.stages[0].name !== '待开始' || flow.stages[0].progress !== 0 ||
-            flow.stages[flow.stages.length-1].name !== '完成' || flow.stages[flow.stages.length-1].progress !== 100) {
+        if (flow.stages[0].name !== 'pending' || flow.stages[0].progress !== 0 ||
+            flow.stages[flow.stages.length-1].name !== 'completed' || flow.stages[flow.stages.length-1].progress !== 100) {
             showToast('流程「' + flow.name + '」首尾锚点不可改名/改值', 'error'); _activeFlowIdx = i; renderStageFlows(); return null;
         }
     }
@@ -1476,17 +1487,20 @@ function initStageFlows() {
 function addSource() {
     var input = document.getElementById('new-source-name');
     var name = input.value.trim(); if (!name) return;
-    var hidden = document.getElementById('source-list-hidden');
-    var list = hidden.value ? hidden.value.split(',') : [];
-    if (list.indexOf(name) !== -1) { showToast('该来源已存在', 'error'); return; }
-    list.push(name); hidden.value = list.join(','); input.value = '';
+    var existing = _sourceItems();
+    for (var i = 0; i < existing.length; i++) {
+        if ((existing[i].dataset.label || existing[i].dataset.name) === name) { showToast('该来源已存在', 'error'); return; }
+    }
     var e = escHtml(name);
     var grid = document.querySelector('#panel-source [style*="display:grid"]');
-    var div = document.createElement('div'); div.className = 'source-item'; div.dataset.name = name;
+    // 新值还没有 code，先把中文名当 token 提交，保存时后端 reconcile 补建行
+    var div = document.createElement('div'); div.className = 'source-item';
+    div.dataset.name = name; div.dataset.label = name;
     div.style.cssText = 'display:flex;align-items:center;gap:var(--space-sm);padding:10px 14px;border:1px solid var(--color-border);border-radius:var(--radius-sm);';
     div.innerHTML = '<span style="flex:1;font-weight:500;min-width:60px;">'+e+'</span><label style="display:flex;align-items:center;gap:4px;font-size:0.78rem;cursor:pointer;white-space:nowrap;"><input type="checkbox" name="platform_'+e+'" value="'+e+'" onchange="toggleFeeInput(this)" style="width:15px;height:15px;cursor:pointer;"> 平台</label><input type="number" name="default_fee_'+e+'" value="5" step="0.5" min="0" max="100" class="fee-input" style="display:none;width:52px;padding:3px 5px;border:1px solid var(--color-border);border-radius:3px;font-size:0.78rem;text-align:center;"><span style="font-size:0.72rem;color:var(--color-text-tertiary);">%</span><button type="button" class="settings-tag-remove source-del-btn" onclick="removeSourceTag(this)" title="删除">×</button>';
     grid.appendChild(div);
-    renderSourceMergeCheckboxes(list);
+    updateSourceHidden();
+    input.value = '';
 }
 
 // 日历模式切换

@@ -1,7 +1,8 @@
 # oimimo scheduler — 架构文档
 
-> **版本**: V2 开发版 · **基准日期**: 2026-07-28
+> **版本**: v1.5.0 · **基准日期**: 2026-10-06
 > 本文档以当前代码事实为准。功能说明见 [PROJECT.md](PROJECT.md)，视觉设计见 [DESIGN.md](DESIGN.md)。
+> v1.5.0 是**后端标准化版本**：枚举值全面英文 code 化，用户界面中文保持不变（详见 §十一.15）。
 
 ---
 
@@ -24,18 +25,19 @@ db.py (SQLite WAL) ── models.py (Pydantic v2 校验)
 orders.db · uploads/ · exports/ · logs/ · backups/
 ```
 
-**代码规模实测**（2026-07-28）：
+**代码规模实测**（2026-10-06，v1.5.0）：
 
 | 文件 | 行数 | 内容 |
 |---|---|---|
-| app.py | 2295 | 74 路由装饰器 · 上下文处理器 · 模板过滤器 · 错误处理 |
-| db.py | 3473 | ~136 函数 · 建表/迁移 · CRUD · 统计 · 注册表 · 备份管理 |
-| models.py | 113 | 4 个 Pydantic 模型 |
-| launcher.py | 410 | Tkinter 窗口 · pystray 托盘 · 重启/日志/端口管理 |
-| image_processor.py | 286 | 原图/预览(800px)/缩略图(200×200) 三级产物 |
-| static/app.js | 1704 | ~70 函数（模态框/抽屉/看板/Toast/ColorPicker/布局/图表主题） |
-| static/app.css | 2852 | 80+ Design Tokens · 组件/视图/响应式样式 |
-| templates/ | 36 HTML | 6 页面 + 15 partials + base + 订单/客户/导出模板 |
+| app.py | 4469 | 126 路由端点（`@app.route` 51 / `@app.post` 66 / `@app.get` 5 / `@app.put` 2 / `@app.delete` 2，运行时 url rule 127 含 static）· 200 顶层函数 · 11 模板过滤器 · 8 模板测试 · 1 上下文处理器 · 1 before_request · 2 errorhandler |
+| db.py | 6248 | 235 顶层函数 · 建表/迁移（M0-M19）· CRUD · 统计 · 注册表 · 备份管理 |
+| models.py | 481 | 13 个 Pydantic v2 模型（订单/收款/客户/回复模板/价目/小票六组） |
+| launcher.py | 463 | Tkinter 窗口 · pystray 托盘 · 重启/日志/端口管理 |
+| image_processor.py | 367 | 原图/预览(800px)/缩略图(200×200) 三级产物 |
+| static/app.js | 2014 | 83 顶层函数（模态框/抽屉/看板/Toast/ColorPicker/布局/图表主题/备份恢复） |
+| static/app.css | 3514 | 61 个静态 CSS 自定义属性 + 服务端 `_build_theme_css()` 运行时注入派生变量 · 组件/视图/响应式样式 |
+| templates/ | 50 HTML | 7 页面（base/index/calendar/income/gallery/settings/stats_lab）+ 17 partials + 订单 10 + 客户 3 + 小工具 13 |
+| tests/ | 26 文件 · 213 test 函数 | `pytest tests/ -q` = **282 passed**（参数化展开后用例数） |
 
 ---
 
@@ -186,8 +188,8 @@ main()
 | 分组 | 列 |
 |---|---|
 | 标识/关联 | id PK · customer_id FK→customers ON DELETE SET NULL |
-| 内容 | project_name · source · is_commercial · commission_type · platform_url · notes · custom_color |
-| 流程 | current_stage · ddl_status · payment_status · stage_flow（本单阶段快照 JSON） |
+| 内容 | project_name · source（Spec 33 存 code，如 mihuashi）· is_commercial · commission_type（code，如 cmt_001）· platform_url · notes · custom_color |
+| 流程 | current_stage（Spec 33 存 code，如 pending/completed）· ddl_status（code，如 normal/overdue）· payment_status（code，如 unpaid/settled）· stage_flow（本单阶段快照 JSON，元素亦为 code）|
 | 财务 | deposit · balance · income · platform_fee · platform_fee_pct（快照）· actual_received · payment_mode（收款方式 simple 默认/installment 分期，Spec 26）|
 | 折扣（Spec19） | discount_pct（订单级折扣快照 %）· discounted_income（折后金额） |
 | 归档 | is_archived · completed_at · is_overdue |
@@ -217,6 +219,8 @@ main()
 
 **receipt_templates（5 列，Spec 23）**：id · name · config_json（只存 style+文案，不存制品/计算参数 D14） · created_at · updated_at；小票草稿另存 settings `receipt_draft` 键（全删全插 CRUD）
 
+**choice_items（10 列，Spec 33 枚举注册表）**：id · kind（stage/ddl/payment/source/commission_type）· code（英文编码 PK 语义）· label（中文展示名）· is_platform（1=平台来源，参与抽成）· default_fee_pct REAL（默认费率 5.0）· sort_order · is_builtin（1=系统内置，不可删）· created_at · updated_at；UNIQUE(kind, code) + 索引 idx_choice_items_kind(kind, sort_order, id)。取代散落的 `platform_sources`/`source_list`/`default_fee_*` settings 键（M11/M12/M13 迁移）；详见 §6.1
+
 ### 5.2 事务模型
 
 `db.transaction()` 上下文管理器：成功 commit、异常 rollback、始终 close。业务函数接受 `conn=` 参数复用外部事务。
@@ -225,17 +229,41 @@ main()
 
 ## 六、核心机制
 
-### 6.1 中央注册表 CHOICE_REGISTRY
+### 6.1 枚举中枢（Spec 33 编码化）
 
-5 类选择列表唯一真实来源（stage/ddl/payment/source/commission_type）。
+**核心契约（D1/D2）**：5 类枚举（stage/ddl/payment/source/commission_type）的**存储值**全面英文编码化——`orders.current_stage/ddl_status/payment_status/source/commission_type` 与 `settings` 相关键只存 code；**展示层恒中文**（所有跨边界输出经翻译层出 label）。code 是稳定内部标识，label 是可变中文文案。
 
-**get_choices() 合并语义**：settings 自定义列表为 base → orders 表去重 auto-discover 新值追加 → 保序去重。
+**三层翻译字典（db.py 唯一真实来源）**：
 
-**进程内缓存**：`_CHOICES_CACHE` 按类别缓存；失效统一走 `_invalidate_choices_cache()`。
+| 字典 | 方向 | 语义 |
+|---|---|---|
+| `CODE_TO_LABEL[kind]` | code → label | 一对一反查，展示用（stage 7 值 / ddl 5 / payment 5 / source 6 / commission_type 8） |
+| `LEGACY_LABEL_TO_CODE[kind]` | 旧中文写法 → code | 多对一「识别输入」，**永久冻结只增不改不删**；迁移与兼容读都依赖它（如 `逾期`/`🔴逾期`→overdue、幽灵值 `待收款`→unpaid） |
+| `RESERVED_ENUM_CODES` | 宽判据保留字集 | 全 kind code ∪ 全部旧标签 ∪ ID 形态 `^(src\|cmt)_\d{3,}$`；新建侧拒绝自定义阶段/来源/类别占用（D17/D18 三层保护） |
+
+**翻译函数**：`enum_code_or_raw(kind, v)` 兼容读——已迁移返回 code、未迁移原样返回旧中文（比较点统一用它，杜绝 code/中文双空间错配）；`enum_label(kind, v, with_emoji)` / `choice_label(kind, code)` 出中文 label；`resolve_choice_code(kind, token)` 任意写法归一到 code。
+
+**统计出口的 code/label 边界（Spec 35 D1-D4）**：分组统计函数**在 db 层单点附 `label`**，原 code 字段保留不动——`_hourly_group_stats` 与 `metric_type_distribution`（`db.py` 末尾）都在返回前用 `{r['code']: r['label'] for r in get_choice_rows(kind)}` 建映射，`label_map.get(code, code)` 未知值原样直通（D3，绝不猜字符集）。API 只新增 `label` 键、原字段与排序不变（D4）。**配色键必须恒为 code**（D2）：`COMMISSION_COLORS` 等前端调色表的键是 `cmt_*` code，`templates/income.html` 因此把「显示标签」与「配色取值」拆成两个数组（`labels` 取 `label`，另建 `var TYPE_CODES` 取 `commission_type` 喂 `seriesColors`）——若把中文标签直接喂给配色查找，全部扇区会退化成 `chartFallbackColor`，等于把显示缺陷修成配色回归。**画布盲区**：Chart.js 的 labels 活在 `<canvas>` 位图里，只扫 DOM 文本的裸 code 门禁会漏检（卡 169 的教训），回归须读 `Chart.getChart(canvas).data.labels`；`tests/test_income_type_labels.py` 以渲染后内联脚本文本为断言面（注意 Jinja `tojson` 会把非 ASCII 转成 `\uXXXX`，断言须两种形态都接受）。
+
+**choice_items 表（Spec 33 新建）**：`kind · code · label · is_platform · default_fee_pct · sort_order · is_builtin`，UNIQUE(kind, code)。系统枚举播种（`seed_choice_items`）+ 用户自定义项落表，取代散落的 `platform_sources`/`source_list`/`default_fee_*` settings 键（M11/M12/M13 迁移）。读路径回退 settings 兜底（播种失败不阻断启动）。
+
+**9 个语义访问器**（签名一字不改，只换返回值空间——改造半径最小化的核心手段，全项目 40+ 调用点自动获益）：`get_paid_statuses()`→`{'settled'}`（现金口径）· `get_archive_paid_statuses()`→`{'settled','waived'}`（归档口径）——**二者必须分离（D7）**：免收订单可归档但不计收入；`is_terminal_stage` / `is_refund_stage` / `get_done_stage` / `get_refund_stage` / `get_terminal_stages` / `get_stage_progress` / `get_ddl_status`。前三个内部先过 `enum_code_or_raw` → 对未迁移值/自定义值/恢复的老备份继续工作。
+
+**get_choices(kind) 合并语义**：系统类（stage/ddl/payment）base = `CODE_TO_LABEL` 的 code 集；用户类（source/commission_type）base = `choice_items` code，auto-discover 追加时**自动补建行**（从「只影响下拉显示」升级为「补登记」）。进程内缓存 `_CHOICES_CACHE`，失效统一走 `_invalidate_choices_cache()`（所有 choice_items 写函数末尾调用）。
+
+**用户枚举 code 空间（卡 168 收口）**：`choice_items` 是来源/类别的唯一事实源。写入侧 `ensure_choice_code(kind, token)`——空 token / 保留字 / 去空白为空则原样返回；命中现有 code 或 label 则归一返回该 code；未命中则同事务内 `_next_choice_code` 补登记一行（`label=token`）并返回 code。`models._normalize_enum_token` 对 source/commission_type 走它，系统三类（stage/ddl/payment）仍走 `enum_code_or_raw`。读侧 `get_user_choice_items(kind) -> [{'code','label'}]` 供界面消费，`get_choices` 用户分支 base 只出 code；`inject_constants` 的 `SOURCE_CHOICES`/`COMMISSION_TYPE_CHOICES`、`_get_existing_values`（datalist）、日历 `filter_options` 全部改用它。改名唯一路径 = 更新 `choice_items.label`（`sync_choice_renames` 已删）；`merge_sources` / `merge_commission_types` 入参出参全 code，费率改写 `choice_items.default_fee_pct` 列。`seed_choice_items` 对内置项也落行、对既有行不改 label/排序/平台标记（用户改名与平台勾选是用户财产）；`_ensure_default_settings` 不再重建 `source_list`/`platform_sources`/`payment_status_list`/`commission_type_list` 四键。
+
+**平台判断必须走 code 空间（卡 169）**：两个访问器出的是不同值空间，不可混用——`get_platform_sources()` 出**标签**集合（给界面文案用），`get_platform_source_codes()` 出 `choice_items.is_platform` 行的 **code** 集合（给判断用）。需要判断「本单来源是不是平台」的地方一律用 code 集合：写入侧 `_calc_financials` 的 `is_platform`、`get_default_fee_for_source`、模板测试 `_test_platform_source`、编辑表单财务块、`detail.html`、`partials/order_row.html`、`export_orders_md` 与 `export/orders.md`。`inject_constants` 因此同时注入 `PLATFORM_SOURCES`（标签，供 JS 比对输入框的中文值）与 `PLATFORM_CODES`（code，供模板判断）。拿 code 去比标签集合的后果不是显示错位那么轻——平台单会被判成非平台，`platform_fee` 静默归零、`actual_received` 虚高，且全程不报错。
+
+**配色键后缀统一 code（卡 169）**：调色板键 `cal_<mid>_<后缀>` 的后缀一律是 **code**（`cal_stage_pending` / `cal_ddl_normal` / `cal_payment_unpaid` / `cal_source_mihuashi` / `cal_commission_cmt_004`），例外只有自定义阶段名（无 code，后缀即中文原名）。四处必须同口径：`_ensure_default_settings` 的默认键、`_build_theme_css` 读链（code 优先、中文键仅作旧值兜底）、设置页着色面板的键生成、M8-M10 迁移的换键结果。中文后缀的残渣键由幂等函数 `_cleanup_legacy_palette_keys` 清除（判据：后缀能被 `resolve_choice_code` 解析成**另一个** code ⇒ 是标签/旧写法；解析不出 ⇒ 自定义名，保留）；其调用点必须在 `init_db` 末尾、迁移引擎之后——`user_version` 由引擎在 init_db 后段才置为 33，且生成型 code（`src_NNN`/`cmt_NNN`）的标签映射由 `seed_choice_items` 写入，两者都就绪判据才准。
+
+**流程快照渲染**：`stage_flow` JSON 的 `name` 迁移后是 code（M6/M7/M15），五个表单模板（`form` / `form_modal` / `form_modal_edit` / `form_inline` / `templates_form`）注入 `STAGE_LABEL_MAP`（= `ENUM_LABELS.stage`）把快照 name 翻成中文再渲染下拉，`option.value` 仍是 code。
+
+**迁移门（D11/D13，全 spec 唯一不可逆数据动作）**：`PRAGMA user_version=33` 为门闸，M0-M19 幂等引擎（`_migrate_enum_codes`）一次性把存量中文值翻成 code；升级前重命名备份 `orders.pre-v1.5.0.db`（永不写入，须永久保留）；M0 预审计（`is_ambiguous_in_column` 严判据）拦截歧义值；迁移失败降级为兼容模式启动（`enum_migration_failed` settings 标记），不阻断使用。M19（`_m19_normalize_enum_columns`）为永久启动守卫，兜住任何残留中文值。
 
 ### 6.2 终态元数据 + 阶段流程
 
-`STAGE_META` / `DDL_STATUS_META` 显式注册 terminal/kind/progress。`STAGE_FLOWS` 流程预设（首尾锚点固定），快照优先链：本单快照 → STAGE_META → 退单=100 / 未知=0。
+`STAGE_META` / `DDL_STATUS_META` 以 **code 为键**显式注册 terminal/kind/progress（DDL 值含 `{kind,label,emoji}`）。`STAGE_FLOWS` 流程预设首尾锚点固定为 `ANCHOR_FIRST_NAME='pending'` / `ANCHOR_LAST_NAME='completed'`（code），快照优先链：本单快照 → STAGE_META → 退单(cancelled)=100 / 未知=0。`validate_stage_flow` 用全 `RESERVED_ENUM_CODES` 拒绝保留字作自定义阶段名。
 
 ### 6.3 自动计算链
 
@@ -275,13 +303,24 @@ main()
 - `delete_backup`：basename 校验防路径穿越 + 仅允许 `orders_backup_*.db` 格式
 - 启动时不自动备份（仅保留手动入口）
 
+**恢复安全链（卡 172，`db.py:2080` `restore_backup`）**——六步顺序，任一步失败即停止且不覆盖现库：
+
+1. **守卫**：`basename(filename) != filename` 拦路径穿越；文件名必须 `orders_backup_*.db`；源文件必须存在
+2. **源预检**：`_validate_sqlite_file(src)`（`db.py:2002`）——失败立即返回，**不备份、不触碰现库**
+3. **同目录临时副本 + 复检**：`tempfile.mkstemp(dir=db_dir, prefix='.restore_')` → `copy2` → 再校验一次（防复制中断或源文件在复制期间变化）
+4. **保护性备份**：现库存在时先 `_do_backup()`，失败即取消恢复（`protective_path` 记录本次备份供回滚）
+5. **原子替换 + 初始化**：`os.replace(tmp_path, DB_PATH)` 避免半个文件；随后 `init_db()`，若抛异常则 `_rollback_to_protective(protective_path, db_dir)`（`db.py:2049`）自动回滚，回滚也失败时返回「请保留现有文件并人工处理」而不静默
+6. **仅最终成功后失效缓存**：`_invalidate_choices_cache()` + `_invalidate_stage_flows_cache()`；`finally` 恒执行 `_remove_tmp_and_sidecars(tmp_path)`（`db.py:2036`）清临时主文件与 `-wal`/`-shm` 边车
+
+**原始库保护（D13）**：`orders.pre-v1.5.0.db` 是 v1.5.0 枚举迁移前的一次性重命名备份，**永不写入、永久保留**，任何清理动作不得触碰；与 `backups/` 下的常规备份是两套东西。
+
 ### 6.7 订单删除自动清理
 
 `delete_order()` 删除订单后检查 `commission_type` / `current_stage` / `source` 三个字段，无订单使用则自动移除对应 `cal_*` 颜色配置。
 
 ### 6.8 收款状态机（Spec 26，只进不退）
 
-- **收齐自动结算**：`add_payment`/`update_payment` 单事务内先模拟校验 Σ笔（≤ 净额+0.01 容差 `PAYMENT_EPSILON`、笔数≤50）→ 写流水 → Σ笔 ≥ actual_received−0.01 且当前'未收款' → 经 `update_order` 置'已结算'走既有归档链 + 客户重算；杜绝 with-return 半成品提交
+- **收齐自动结算**：`add_payment`/`update_payment` 单事务内先模拟校验 Σ笔（≤ 净额+0.01 容差 `PAYMENT_EPSILON`、笔数≤50）→ 写流水 → Σ笔 ≥ actual_received−0.01 且当前 `enum_code_or_raw('payment',…)=='unpaid'`（未收款）→ 经 `update_order` 置 `settled`（已结算）走既有归档链 + 客户重算；杜绝 with-return 半成品提交。免收互斥同样经 `enum_code_or_raw(…)=='waived'` 判定（Spec 33 比较点统一兼容读）
 - **只进不退（D4）**：删笔/改笔不回退状态、不撤销归档；不一致由详情页警告条呈现（状态已结算但 Σ笔 < 净额−0.01）
 - **金额冲突拦截（D12①）**：update_order 金额改小致净额 < 已到账−0.01 → 拒绝并整单回滚
 - **切换双向保护（D12③）**：installment 有收款记录拒绝切回 simple（先清空再切）；simple 已收齐切 installment 同事务自动生成 1 笔初始收款 [有效排期日或今日, actual_received]（0 元跳过留痕）
@@ -304,7 +343,7 @@ main()
 | 右抽屉 | `?inline=1` | JSON + HX-Trigger |
 | 完整页 | 默认 | redirect |
 
-### 7.3 app.js 模块（~70 函数）
+### 7.3 app.js 模块（83 函数）
 
 模态框/抽屉 · 看板（SortableJS） · 回执小票 · Toast · 导出 · 侧边栏 · Lightbox · 图片上传 · 模块定制器 · 错误日志 · ColorPicker（原生零依赖 ~230 行）· 图表主题 helper · gridstack 布局管理 · 小工具桥接（`recordRecentTool` + closeCenterModal/showToast 事件监听 + `.tool-htmx-form` 400 换入）· **页面导航**：`runPageInit()` 三路径统一初始化（DOMContentLoaded / htmx:afterSettle boosted / htmx:historyRestore）· `updateSidebarActive()` 侧边栏高亮 · `onceBind()` 会话级一次性绑定 · 脏数据拦截（form `__formDirty` → `htmx:beforeRequest` boosted GET confirm）
 
@@ -350,7 +389,7 @@ HTMX+Lucide+JsBarcode（base.html 全局）；Frappe Gantt / Chart.js / FullCale
 
 ### 9.1 主题引擎（Spec 32）
 
-服务端渲染时由 `theme_css(settings)` 生成 `:root` 变量块：
+服务端渲染时由 `_build_theme_css(settings)`（`app.py:353`，经 `base.html` 注入 `<style>`）生成 `:root` 变量块：
 
 - **亮度判深**：`_relative_luminance(theme_bg)` < 0.35 判深色主题（缺键/非法值回退浅色）
 - **accent 对比字色**：`db._contrast_text_color(accent)` 注入 `--color-accent-text`，`--color-accent-hover` 向对比极混合 15%；按钮文字统一消费 accent-text，白/黑 accent 均可见
@@ -358,7 +397,7 @@ HTMX+Lucide+JsBarcode（base.html 全局）；Frappe Gantt / Chart.js / FullCale
 - **warning 主题派生**（卡 154）：浅色主题下 `--color-warning` 压暗为 `color-mix(warning 55%, #000)` 深琥珀（亮琥珀黄作文字对浅底 ratio≈1.8 不可见），深色主题保持用户原值
 - **color-scheme**：按深色判定注入 `dark`/`light`，原生控件（select/date 弹层）随主题配色
 - **预览同步**：settings.html `applyPreset`/单色微调实时同步上述派生（`_relLuminance`/`_syncColorScheme`/`_syncAccentDerived`/`_warningEffective` 等 helper），预览态与保存后一致
-- **缓存穿透**：app.css/app.js 引用带 `?v={{ APP_VERSION }}`，改静态资源必升 APP_VERSION（当前 1.4.0）
+- **缓存穿透**：app.css/app.js 引用带 `?v={{ APP_VERSION }}`，改静态资源必升 APP_VERSION（当前 1.5.0，`app.py:102`）
 
 ---
 
@@ -390,6 +429,7 @@ HTMX+Lucide+JsBarcode（base.html 全局）；Frappe Gantt / Chart.js / FullCale
 12. **口径分离 + 事件流（Spec 26）**：工作口径看进展、现金口径看到账；整单虚拟事件数学等价保旧数据逐位不变；收款状态机只进不退
 13. **主题引擎派生变量（Spec 32）**：亮度判深（阈值 0.35）+ accent 对比字色 + 深色六项派生 + warning 浅色压暗，服务端注入与设置页预览同口径，双主题对比度 ratio≥3 审计保障
 14. **hx-boost 局部导航（卡 156）**：`<body hx-boost>` + `<aside hx-preserve>` 实现类 SPA 导航（仅 `<main>` AJAX 刷新），View Transitions 平滑转场；`runPageInit()` 消费式初始化三路径统一；`HX-Boosted` 请求头分支返回完整页（非 fragment）
+15. **枚举编码化（Spec 33，v1.5.0）**：存储值全面英文 code、展示层恒中文——code 是稳定内部标识（不随文案改动而失效），label 可自由改中文。三层翻译字典（`CODE_TO_LABEL` 一对一反查 / `LEGACY_LABEL_TO_CODE` 永久冻结识别输入 / `RESERVED_ENUM_CODES` 宽判据保留字）+ `enum_code_or_raw` 兼容读，使 code 空间与未迁移中文空间可共存。迁移门 `user_version=33` + M0-M19 幂等引擎 + 升级前重命名备份 `orders.pre-v1.5.0.db`（永不写入），失败降级兼容模式启动（全 spec 唯一不可逆数据动作，D11/D13）。`PAID_STATUSES={'settled'}` 与 `ARCHIVE_PAID_STATUSES={'settled','waived'}` 强制分离（D7）：免收可归档不计收入。choice_items 表收编散落的来源/费率 settings 键
 
 ---
 

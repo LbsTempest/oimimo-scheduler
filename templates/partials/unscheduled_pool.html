@@ -8,13 +8,13 @@
         <div class="pool-card-meta">
             <span>
                 <span class="stage-badge {{ o.current_stage|stage_class }}">
-                    {{ o.current_stage }}
+                    {{ o.current_stage|stage_label }}
                 </span>
             </span>
             <span class="amount">¥{{ "%.0f"|format(o.income) }}</span>
         </div>
         <div style="font-size:0.72rem;color:var(--color-text-tertiary);margin-top:2px;">
-            {{ o.customer_name or '未分配' }} · {{ o.source }}
+            {{ o.customer_name or '未分配' }} · {{ o.source|source_label }}
         </div>
     </div>
     {% endfor %}

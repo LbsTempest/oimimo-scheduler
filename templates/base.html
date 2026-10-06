@@ -52,6 +52,8 @@
     </script>
 
     {% block head_extra %}{% endblock %}
+    <!-- Spec 33 卡 161：枚举翻译层注入前端 JS -->
+    <script id="oimimo-enums" type="application/json">{{ ENUM_JSON|tojson }}</script>
 </head>
 <body hx-boost="true">
     <div class="app-layout">
@@ -123,6 +125,18 @@
 
         <!-- 主内容区 -->
         <main class="main-content" id="main-content">
+            {# Spec 33 D12：数据库迁移失败降级为兼容模式时，全站顶部常驻警告 #}
+            {% if migration_failed %}
+            <div class="migration-alert" role="alert">
+                <i data-lucide="alert-triangle"></i>
+                <div>
+                    <strong>数据库升级未完成，当前以兼容模式运行。</strong>
+                    继续记账可能导致金额与统计不准确。请先联系开发者处理，或到
+                    设置&nbsp;→&nbsp;数据恢复 恢复迁移前备份（原文件已保留为
+                    <code>orders.pre-v1.5.0.db</code>）。
+                </div>
+            </div>
+            {% endif %}
             <!-- 面包屑导航（一级页不显示） -->
             {% set primary_pages = ['/', '/income', '/calendar', '/orders', '/orders/kanban', '/customers', '/gallery', '/settings', '/templates', '/tools'] %}
             {% if request.path not in primary_pages %}

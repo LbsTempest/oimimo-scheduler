@@ -1,6 +1,7 @@
 # oimimo scheduler — 设计系统文档
 
-> **基准日期**: 2026-07-28 · 本文档以 `static/app.css`（2852 行）与模板实测为准。
+> **基准日期**: 2026-10-06 · 本文档以 `static/app.css`（3514 行）与模板实测为准。
+> 深色主题由后端 `_build_theme_css()`（`app.py:353`，经 `base.html` 注入 `<style>`）运行时派生（Spec 32），本文只登记静态 `:root` 基线；机制见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 > 架构与数据流见 [ARCHITECTURE.md](ARCHITECTURE.md)；设计技能：`/clean` `/sleek` `/shadcn` `/theme-factory` `/spacious` `/frontend-design`。
 
 ---

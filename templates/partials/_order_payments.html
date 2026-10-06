@@ -8,7 +8,7 @@
         {# D4 只进不退：状态已结算但 Σ笔 < 净额−0.01（删笔不回退状态）→ 呈现层提示 #}
         {% if payments_inconsistent %}
         <div class="payments-warn">
-            收款状态为「{{ order.payment_status|e }}」，但已到账合计（¥{{ "%.2f"|format(payments_received) }}）低于应收净额（¥{{ "%.2f"|format(order.actual_received or 0) }}）。
+            收款状态为「{{ order.payment_status|payment_label|e }}」，但已到账合计（¥{{ "%.2f"|format(payments_received) }}）低于应收净额（¥{{ "%.2f"|format(order.actual_received or 0) }}）。
             删除收款记录不会自动回退状态（只进不退），请核对后手动调整收款状态。
         </div>
         {% endif %}

@@ -1,37 +1,37 @@
 {# 看板卡片 — Spec12：用快照阶段替代硬编码 stage_order/stage_border #}
 {% set flow_stages = order.get('_stage_flow_parsed') or [] %}
-{# 从快照中找当前索引，计算 prev/next #}
+{# 从快照中找当前索引，计算 prev/next（Spec33 卡 163：归一化到 code 空间比较） #}
 {% set ns = namespace(cur_idx=-1) %}
 {% for s in flow_stages %}
-    {% if s.name == order.current_stage and ns.cur_idx == -1 %}{% set ns.cur_idx = loop.index0 %}{% endif %}
+    {% if s.name|stage_code == order.current_stage|stage_code and ns.cur_idx == -1 %}{% set ns.cur_idx = loop.index0 %}{% endif %}
 {% endfor %}
 {% set cur_idx = ns.cur_idx %}
 {% set prev_stage = flow_stages[cur_idx - 1].name if cur_idx > 0 else None %}
 {% set next_stage = flow_stages[cur_idx + 1].name if cur_idx >= 0 and cur_idx < flow_stages|length - 1 else None %}
 {% set card_class = '' %}
-{% if order.ddl_status == '🔴逾期' %}{% set card_class = 'overdue' %}
-{% elif order.ddl_status == '即将到期' %}{% set card_class = 'due-soon' %}
+{% if order.ddl_status is overdue_ddl %}{% set card_class = 'overdue' %}
+{% elif order.ddl_status is due_ddl %}{% set card_class = 'due-soon' %}
 {% endif %}
 {% set stage_slug = order.current_stage|stage_class %}
 <div class="kanban-card {{ card_class }}"
      data-order-id="{{ order.id }}"
      data-income="{{ order.income }}"
      data-commercial="{{ 1 if order.is_commercial else 0 }}"
-     data-overdue="{{ 1 if (order.is_overdue or order.ddl_status == '🔴逾期') else 0 }}"
+     data-overdue="{{ 1 if (order.is_overdue or order.ddl_status is overdue_ddl) else 0 }}"
      style="border-left-color: var(--stage-{{ stage_slug }}, var(--color-border-strong));"
      onclick="event.stopPropagation(); openEditDrawer({{ order.id }});">
     <!-- 悬浮操作按钮 -->
     <div class="kanban-card-actions" onclick="event.stopPropagation();">
         {% if prev_stage %}
-        <button class="kanban-card-action" title="移到「{{ prev_stage }}」"
-                onclick="quickStageSwitch({{ order.id }}, '{{ prev_stage }}')">◀</button>
+        <button class="kanban-card-action" title="移到「{{ prev_stage|stage_label }}」"
+                onclick="quickStageSwitch({{ order.id }}, '{{ prev_stage|stage_code }}')">◀</button>
         {% endif %}
         {% if next_stage %}
-        <button class="kanban-card-action" title="移到「{{ next_stage }}」"
-                onclick="quickStageSwitch({{ order.id }}, '{{ next_stage }}')">▶</button>
+        <button class="kanban-card-action" title="移到「{{ next_stage|stage_label }}」"
+                onclick="quickStageSwitch({{ order.id }}, '{{ next_stage|stage_code }}')">▶</button>
         {% endif %}
         <button class="kanban-card-action done" title="完成"
-                onclick="quickStageSwitch({{ order.id }}, '完成')">✓</button>
+                onclick="quickStageSwitch({{ order.id }}, 'completed')">✓</button>
     </div>
     <div class="kanban-card-title">{{ order.project_name }}{% if order.is_overdue %} <span class="status-badge overdue" style="font-size:0.65rem;">逾期</span>{% endif %}</div>
     <div class="kanban-card-meta">
@@ -39,11 +39,11 @@
         <span class="kanban-card-amount">¥{{ "%.0f"|format(order.income) }}</span>
     </div>
     {# P20c：完成阶段角标显示时薪（防其他列噪音） #}
-    {% if hourly_rate_enabled and order.current_stage == '完成' %}
+    {% if hourly_rate_enabled and order.current_stage is done_stage %}
     {% import "partials/_macros.html" as m %}
     <div style="margin-top:4px;">{{ m.hourly_badge(order) }}</div>
     {% endif %}
-    {% if order.ddl_status == '🔴逾期' %}
+    {% if order.ddl_status is overdue_ddl %}
     <div style="margin-top:4px;">
         <span class="status-badge overdue">逾期</span>
     </div>

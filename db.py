@@ -5,10 +5,12 @@
 
 import sqlite3
 import os
+import re
 import sys
 import json
 import shutil
 import logging
+import tempfile
 from contextlib import contextmanager, nullcontext
 from datetime import date, datetime, timedelta
 
@@ -92,6 +94,347 @@ def transaction():
         raise
     finally:
         conn.close()
+
+
+# ═══════════════════════════════════════════════════════════
+# Spec 33 卡 165：幂等自动迁移引擎（M0-M19）
+# 唯一不可逆数据动作——四重兜底：M0 预审计 + 原文件 rename 保留 +
+# 失败降级兼容模式 + user_version 自愈
+# ═══════════════════════════════════════════════════════════
+
+ENUM_CODE_MIGRATION_VERSION = 33
+
+
+def _enum_codes_migrated(conn) -> bool:
+    """PRAGMA user_version >= 33 即已迁移（D11：不用 settings 标记键）。"""
+    return conn.execute('PRAGMA user_version').fetchone()[0] >= ENUM_CODE_MIGRATION_VERSION
+
+
+def _pre_migration_backup() -> str | None:
+    """D13 双重保护：WAL checkpoint → rename 原文件为 orders.pre-v1.5.0.db 永久保留。
+    空库/已备份过 → 跳过返回 None。返回备份路径。"""
+    import shutil
+    db_path = DB_PATH
+    if not os.path.exists(db_path):
+        return None
+    bak = db_path.replace('orders.db', 'orders.pre-v1.5.0.db')
+    if os.path.exists(bak):
+        return bak  # 已备份过（自愈重跑场景）
+    try:
+        c = sqlite3.connect(db_path)
+        c.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        c.close()
+    except Exception as e:
+        logger.error('M-backup WAL checkpoint 失败: %s', e)
+    shutil.move(db_path, bak)
+    logger.info('enum-mig 原文件已 rename 保留: %s', ascii(bak))
+    return bak
+
+
+def _map_stage_flow_text(raw):
+    """M6/M7/M15 共用纯函数：JSON 数组里每个 stage 的 name 换 code。
+    返回 (新文本, 变更次数)。非 JSON / 非 list 原样返回。"""
+    if not raw:
+        return raw, 0
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return raw, 0
+    if not isinstance(data, list):
+        return raw, 0
+    changed = 0
+    stage_map = LEGACY_LABEL_TO_CODE.get('stage', {})
+    for entry in data:
+        stages = entry.get('stages') if isinstance(entry, dict) else None
+        targets = stages if isinstance(stages, list) else ([entry] if isinstance(entry, dict) else [])
+        for st in targets:
+            if not isinstance(st, dict) or 'name' not in st:
+                continue
+            new = stage_map.get(st['name'], st['name'])
+            if new != st['name']:
+                st['name'] = new
+                changed += 1
+    return json.dumps(data, ensure_ascii=False), changed
+
+
+def _rename_settings_key(conn, prefix: str, mapping: dict) -> int:
+    """M8/M9/M10/M17 共用纯函数：把 cal_<kind>_<中文后缀> 换键为 cal_<kind>_<code>。
+    只处理命中映射的键；自定义值键不动。返回换键数。"""
+    rows = conn.execute(
+        'SELECT key, value FROM settings WHERE key LIKE ?', (prefix + '%',)
+    ).fetchall()
+    n = 0
+    for key, value in rows:
+        label = key[len(prefix):]
+        code = mapping.get(label)
+        if not code or code == label:
+            continue
+        new_key = prefix + code
+        conn.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
+                     (new_key, value))
+        conn.execute('DELETE FROM settings WHERE key = ?', (key,))
+        n += 1
+    return n
+
+
+def _m0_pre_audit(conn) -> list:
+    """M0 保留字碰撞预审计（D17 第 3 层）。返回冲突列表；非空即中止迁移。"""
+    conflicts = []
+    for kind, column in ENUM_FIELD.items():
+        legal_codes = set(CODE_TO_LABEL.get(kind, {}))
+        legacy_labels = set(LEGACY_LABEL_TO_CODE.get(kind, {}))
+        rows = conn.execute(
+            f'SELECT {column} AS v, COUNT(*) AS n FROM orders '
+            f'WHERE {column} IS NOT NULL GROUP BY {column}'
+        ).fetchall()
+        for r in rows:
+            v = r[0] if isinstance(r, tuple) else r['v']
+            if not isinstance(v, str):
+                continue
+            if is_ambiguous_in_column(kind, v):
+                conflicts.append(
+                    f'{column}(kind={kind}) 存自定义值 {ascii(v)}，与本列系统 code 同名，'
+                    f'转码后无法区分，影响 {r[1] if isinstance(r, tuple) else r["n"]} 行')
+    return conflicts
+
+
+def _migrate_enum_codes(conn) -> None:
+    """M0-M18 全项迁移（单事务内调用，不含 M19——M19 是常态守卫独立运行）。
+    异常由调用方捕获并走 D12 降级。"""
+    # M0
+    conflicts = _m0_pre_audit(conn)
+    if conflicts:
+        raise RuntimeError('M0 保留字碰撞预审计未通过：\n' + '\n'.join(conflicts))
+
+    # 确保 choice_items 表存在
+    ensure_choice_items_table(conn)
+
+    # M4/M5 前置：seed 得到 source/commission_type 的完整 label→code 表
+    _all_maps = seed_choice_items(conn)
+    src_map = _all_maps.get('source', {})
+    cmt_map = _all_maps.get('commission_type', {})
+
+    col_maps = {
+        'current_stage': LEGACY_LABEL_TO_CODE.get('stage', {}),
+        'ddl_status': LEGACY_LABEL_TO_CODE.get('ddl', {}),
+        'payment_status': LEGACY_LABEL_TO_CODE.get('payment', {}),
+        'source': src_map,
+        'commission_type': cmt_map,
+    }
+
+    # M1-M5：CASE 批量转码（不带 updated_at，D16）
+    for kind, column in ENUM_FIELD.items():
+        mapping = {k: v for k, v in col_maps[column].items() if k != v}
+        if not mapping:
+            continue
+        cases = ' '.join(f"WHEN ? THEN ?" for _ in mapping)
+        params = []
+        for old, code in mapping.items():
+            params.extend([old, code])
+        olds = list(mapping.keys())
+        ph = ','.join('?' * len(olds))
+        cur = conn.execute(
+            f'UPDATE orders SET {column} = CASE {column} {cases} ELSE {column} END '
+            f'WHERE {column} IN ({ph})', params + olds)
+        if cur.rowcount:
+            logger.info('enum-mig M1-5/%s: %d 行', column, cur.rowcount)
+
+    # M6 orders.stage_flow
+    m6 = 0
+    for row in conn.execute(
+            "SELECT id, stage_flow FROM orders WHERE stage_flow IS NOT NULL AND stage_flow!=''").fetchall():
+        oid = row[0] if isinstance(row, tuple) else row['id']
+        raw = row[1] if isinstance(row, tuple) else row['stage_flow']
+        new, n = _map_stage_flow_text(raw)
+        if n:
+            conn.execute('UPDATE orders SET stage_flow=? WHERE id=?', (new, oid))
+            m6 += n
+    if m6:
+        logger.info('enum-mig M6/stage_flow: %d 处阶段名', m6)
+
+    # M7 order_templates.data_json（含内层二次字符串化）
+    m7 = 0
+    try:
+        for row in conn.execute(
+                'SELECT id, data_json FROM order_templates WHERE data_json IS NOT NULL').fetchall():
+            tid = row[0] if isinstance(row, tuple) else row['id']
+            dj = row[1] if isinstance(row, tuple) else row['data_json']
+            try:
+                obj = json.loads(dj)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(obj, dict):
+                continue
+            touched = 0
+            for field in ('source', 'current_stage', 'payment_status', 'ddl_status', 'commission_type'):
+                if field in obj and isinstance(obj[field], str):
+                    m = col_maps.get(field, {})
+                    nv = m.get(obj[field], obj[field])
+                    if nv != obj[field]:
+                        obj[field] = nv
+                        touched += 1
+            inner = obj.get('stage_flow')
+            if isinstance(inner, str):
+                new_inner, n = _map_stage_flow_text(inner)
+                if n:
+                    obj['stage_flow'] = new_inner
+                    touched += n
+            if touched:
+                conn.execute('UPDATE order_templates SET data_json=? WHERE id=?',
+                             (json.dumps(obj, ensure_ascii=False), tid))
+                m7 += touched
+    except Exception:
+        pass  # order_templates 表可能不存在
+    if m7:
+        logger.info('enum-mig M7/order_templates: %d 处', m7)
+
+    # M8-M10 settings cal_* 换键
+    _CAL_PREFIX = {'cal_stage_': 'current_stage', 'cal_ddl_': 'ddl_status',
+                   'cal_payment_': 'payment_status', 'cal_source_': 'source',
+                   'cal_commission_': 'commission_type'}
+    m8_total = 0
+    for prefix, column in _CAL_PREFIX.items():
+        m8_total += _rename_settings_key(conn, prefix, col_maps[column])
+    if m8_total:
+        logger.info('enum-mig M8-10/cal_*: %d 键', m8_total)
+
+    # M11 default_fee_* → choice_items.default_fee_pct 列
+    m11 = 0
+    for row in conn.execute(
+            "SELECT key, value FROM settings WHERE key LIKE 'default_fee_%'").fetchall():
+        key = row[0] if isinstance(row, tuple) else row['key']
+        value = row[1] if isinstance(row, tuple) else row['value']
+        label = key[len('default_fee_'):]
+        code = src_map.get(label)
+        if not code:
+            continue
+        try:
+            conn.execute('UPDATE choice_items SET default_fee_pct=? WHERE kind=? AND code=?',
+                         (float(value or 0), 'source', code))
+            conn.execute('DELETE FROM settings WHERE key=?', (key,))
+            m11 += 1
+        except (TypeError, ValueError):
+            logger.warning('enum-mig M11 跳过非数值费率 %s', ascii(key))
+    if m11:
+        logger.info('enum-mig M11/default_fee: %d 键搬入列', m11)
+
+    # M12 platform_sources → choice_items.is_platform 列
+    plat_row = conn.execute("SELECT value FROM settings WHERE key='platform_sources'").fetchone()
+    if plat_row:
+        plats = [x.strip() for x in (plat_row[0] or '').split(',') if x.strip()]
+        for label in plats:
+            code = src_map.get(label)
+            if code:
+                conn.execute('UPDATE choice_items SET is_platform=1 WHERE kind=? AND code=?',
+                             ('source', code))
+        conn.execute("DELETE FROM settings WHERE key='platform_sources'")
+        logger.info('enum-mig M12/platform_sources: %d 个搬入列', len(plats))
+
+    # M13 source_list / commission_type_list 删键（顺序已进 sort_order）
+    for key in ('source_list', 'commission_type_list'):
+        conn.execute('DELETE FROM settings WHERE key=?', (key,))
+
+    # M14 payment_status_list 直删
+    conn.execute("DELETE FROM settings WHERE key='payment_status_list'")
+
+    # M15 settings.stage_flows JSON
+    sf = conn.execute("SELECT value FROM settings WHERE key='stage_flows'").fetchone()
+    if sf:
+        new, n = _map_stage_flow_text(sf[0])
+        if n:
+            conn.execute("UPDATE settings SET value=? WHERE key='stage_flows'", (new,))
+            logger.info('enum-mig M15/stage_flows: %d 处', n)
+
+    # M16 stats_lab_presets JSON
+    sp = conn.execute("SELECT value FROM settings WHERE key='stats_lab_presets'").fetchone()
+    if sp:
+        m16 = 0
+        try:
+            presets = json.loads(sp[0])
+        except (ValueError, TypeError):
+            presets = []
+        for p in presets if isinstance(presets, list) else []:
+            filters = (p.get('config') or {}).get('filters') or {}
+            for field in ENUM_FIELD:
+                if field in filters:
+                    m = col_maps.get(field, {})
+                    nv = m.get(filters[field], filters[field])
+                    if nv != filters[field]:
+                        filters[field] = nv
+                        m16 += 1
+        if m16:
+            conn.execute("UPDATE settings SET value=? WHERE key='stats_lab_presets'",
+                         (json.dumps(presets, ensure_ascii=False),))
+            logger.info('enum-mig M16/stats_lab_presets: %d 处', m16)
+
+    # M17 palette_presets colors 字典换键
+    pp = conn.execute("SELECT value FROM settings WHERE key='palette_presets'").fetchone()
+    if pp:
+        m17 = 0
+        try:
+            presets = json.loads(pp[0])
+        except (ValueError, TypeError):
+            presets = []
+        for preset in presets if isinstance(presets, list) else []:
+            colors = preset.get('colors')
+            if not isinstance(colors, dict):
+                continue
+            newcolors = {}
+            for k, v in colors.items():
+                nk = k
+                for prefix, column in _CAL_PREFIX.items():
+                    if k.startswith(prefix):
+                        label = k[len(prefix):]
+                        code = col_maps[column].get(label)
+                        if code and code != label:
+                            nk = prefix + code
+                            m17 += 1
+                        break
+                newcolors[nk] = v
+            if m17:
+                preset['colors'] = newcolors
+        if m17:
+            conn.execute("UPDATE settings SET value=? WHERE key='palette_presets'",
+                         (json.dumps(presets, ensure_ascii=False),))
+            logger.info('enum-mig M17/palette_presets: %d 键', m17)
+
+    # M18 platform_fee_* 死配置直删
+    pf = conn.execute("SELECT COUNT(*) FROM settings WHERE key LIKE 'platform_fee_%'").fetchone()[0]
+    if pf:
+        conn.execute("DELETE FROM settings WHERE key LIKE 'platform_fee_%'")
+        logger.info('enum-mig M18/platform_fee_*: %d 键删除', pf)
+
+    # 版本闸
+    conn.execute(f'PRAGMA user_version = {ENUM_CODE_MIGRATION_VERSION}')
+    logger.info('enum-mig 完成，user_version = %d', ENUM_CODE_MIGRATION_VERSION)
+
+
+def _m19_normalize_enum_columns(conn) -> None:
+    """Spec33 M19 常态守卫：把 orders 表 3 列中命中冻结表已知旧值的行归一到 code。
+
+    只认 LEGACY_LABEL_TO_CODE 已知旧值，绝不猜测（自定义阶段名/脏值原样保留）。
+    天然幂等：已是 code 的值不命中 WHERE IN 子句。
+    不带 updated_at（D16：避免 ETag 漂移惊动已订阅日历客户端）。
+    """
+    for kind, column in (('stage', 'current_stage'), ('ddl', 'ddl_status'), ('payment', 'payment_status')):
+        mapping = LEGACY_LABEL_TO_CODE.get(kind, {})
+        if not mapping:
+            continue
+        old_vals = list(mapping.keys())
+        placeholders = ','.join('?' * len(old_vals))
+        # 构建 CASE 表达式：旧值 → code
+        case_parts = []
+        params = []
+        for old, code in mapping.items():
+            case_parts.append(f"WHEN ? THEN ?")
+            params.extend([old, code])
+        case_sql = f"CASE {column} {' '.join(case_parts)} ELSE {column} END"
+        cur = conn.execute(
+            f"UPDATE orders SET {column} = {case_sql} WHERE {column} IN ({placeholders})",
+            params + old_vals
+        )
+        if cur.rowcount:
+            logger.info('enum-mig M19/%s: %d 行归一', column, cur.rowcount)
 
 
 def init_db():
@@ -283,6 +626,16 @@ def init_db():
     # 写入默认设置（仅当不存在时）
     _ensure_default_settings(conn)
 
+    # Spec 33 卡 159：来源/稿件类别稳定 ID 表 + 幂等播种。
+    # 卡 168 起 `source_list`/`commission_type_list` 不再是默认键，只可能以「未迁移库
+    # 的用户原序」形式存在，seed 读得到就用、读不到就用 choice_items.sort_order。
+    # 失败仅记日志不阻断启动（seed 是增量能力，老路径有 settings 兜底）。
+    try:
+        seed_choice_items(conn)
+        conn.commit()
+    except Exception as e:
+        logger.error('choice_items 播种失败（不阻断启动，读路径回退 settings）：%s', e)
+
     # 迁移：为旧数据库补齐后续新增列（新建库已在 CREATE TABLE 中定义，此处幂等）
     for col in ('custom_color', 'platform_url', 'page_deadline', 'image_url', 'image_path'):
         try:
@@ -293,11 +646,25 @@ def init_db():
         conn.execute("ALTER TABLE orders ADD COLUMN has_image INTEGER NOT NULL DEFAULT 0")
     except Exception:
         pass  # 列已存在
-    # P19-F4 幽灵收款状态归一：历史默认值「待收款」及数字/空串污染 → 锁定值「未收款」。幂等。
+    # P19-F4 幽灵收款状态归一：历史默认值「待收款」及数字/空串污染 → 锁定值。幂等。
+    # 目标值随枚举迁移态切换：未迁移写中文旧标签（留给迁移引擎转码），已迁移写 code。
+    # 硬约束：迁移前绝不能写 code——否则旧库被提前改成半 code 状态，迁移闸门 M0 会把
+    # 这些 code 误判成「用户自定义值与系统 code 重名」而永久中止迁移（卡 167 实测）。
+    _ghost_paid = 'unpaid' if _enum_codes_migrated(conn) else '未收款'
     try:
-        conn.execute("UPDATE orders SET payment_status='未收款' WHERE payment_status IN ('待收款','0','') OR payment_status = 0 OR payment_status IS NULL")
+        conn.execute(
+            "UPDATE orders SET payment_status=? WHERE payment_status IN ('待收款','0','') "
+            "OR payment_status = 0 OR payment_status IS NULL", (_ghost_paid,))
     except Exception:
         pass
+    # Spec33 M19 常态守卫（非一次性）：把命中冻结表已知旧值的行归一到 code。
+    # 只认 LEGACY_LABEL_TO_CODE 已知旧值，绝不猜测；天然幂等（code 值不命中 WHERE）。
+    # 同理只在 code 空间（user_version>=33）才允许跑：未迁移的老库由迁移引擎 M1-M5 负责转码。
+    if _enum_codes_migrated(conn):
+        try:
+            _m19_normalize_enum_columns(conn)
+        except Exception as e:
+            logger.error('M19 枚举列归一守卫失败: %s', e)
     # P15a 迁移：完成归档时间与逾期标记
     try:
         conn.execute("ALTER TABLE orders ADD COLUMN completed_at TEXT")
@@ -451,19 +818,109 @@ def init_db():
 
     conn.commit()
     conn.close()
+
+    # ═══ Spec 33 卡 165：幂等自动迁移引擎（M0-M18）═══
+    # 插入位置硬约束：_ensure_default_settings + 所有 ALTER TABLE 之后、累计消费重算之前
+    _migration_failed = False
+    try:
+        _chk = sqlite3.connect(DB_PATH)
+        _need_mig = not _enum_codes_migrated(_chk)
+        _chk.close()
+    except Exception:
+        _need_mig = False
+    if _need_mig:
+        import shutil as _shutil
+        _bak = DB_PATH.replace('orders.db', 'orders.pre-v1.5.0.db')
+        try:
+            # D13：WAL checkpoint → rename 原文件永久保留
+            _c = sqlite3.connect(DB_PATH)
+            _c.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+            _c.close()
+            if not os.path.exists(_bak):
+                _shutil.move(DB_PATH, _bak)
+                logger.info('enum-mig D13 原文件 rename 保留: %s', ascii(_bak))
+            if not os.path.exists(DB_PATH):
+                # 工作副本缺失（首次迁移或上次中断）才从备份取一致快照（含 WAL 内容）。
+                # 硬约束：绝不能用备份覆盖已存在的工作副本——否则两次启动之间录入的数据
+                # 会被静默丢弃（卡 167 实测：72 单被回退成 71 单）。
+                _src = sqlite3.connect(f'file:{_bak}?mode=ro', uri=True)
+                _dst_new = sqlite3.connect(DB_PATH)
+                _src.backup(_dst_new)
+                _src.close()
+                _dst_new.close()
+            # 在工作副本上跑迁移（单事务）
+            _dst = sqlite3.connect(DB_PATH)
+            _dst.row_factory = sqlite3.Row
+            _dst.execute('PRAGMA foreign_keys=ON')
+            try:
+                _migrate_enum_codes(_dst)
+                _dst.commit()
+                logger.info('enum-mig 迁移成功，user_version=%d', ENUM_CODE_MIGRATION_VERSION)
+            except Exception as _me:
+                _dst.rollback()
+                _dst.close()
+                # D12 降级：放回原文件，以兼容模式正常启动
+                logger.error('enum-mig 迁移失败，降级兼容模式: %s', _me, exc_info=True)
+                try:
+                    os.remove(DB_PATH)
+                except OSError:
+                    pass
+                _shutil.copy2(_bak, DB_PATH)
+                _migration_failed = True
+                # 落堆栈到日志文件
+                try:
+                    _logdir = os.path.join(os.path.dirname(DB_PATH), 'logs')
+                    os.makedirs(_logdir, exist_ok=True)
+                    import traceback
+                    with open(os.path.join(_logdir, 'enum-migration-error.log'), 'a', encoding='utf-8') as _lf:
+                        _lf.write(f'\n=== {datetime.now().isoformat()} ===\n')
+                        traceback.print_exc(file=_lf)
+                except Exception:
+                    pass
+            else:
+                _dst.close()
+        except Exception as _be:
+            logger.error('enum-mig 备份/迁移异常，降级兼容模式: %s', _be, exc_info=True)
+            _migration_failed = True
+            # 确保 DB_PATH 存在（可能被 rename 走了）
+            if not os.path.exists(DB_PATH) and os.path.exists(_bak):
+                try:
+                    _shutil.copy2(_bak, DB_PATH)
+                except Exception:
+                    pass
+    # 迁移失败标记供设置页提示条读取（D12）
+    if _migration_failed:
+        try:
+            _fc = get_db()
+            _fc.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('enum_migration_failed', '1')")
+            _fc.commit()
+            _fc.close()
+        except Exception:
+            pass
+    else:
+        try:
+            _fc = get_db()
+            _fc.execute("DELETE FROM settings WHERE key='enum_migration_failed'")
+            _fc.commit()
+            _fc.close()
+        except Exception:
+            pass
+
     # 迁移：累计消费口径变更（仅统计已归档+已完成+已结算订单），一次性重算全部客户
     try:
         _mig_conn = get_db()
         _cids = [r[0] for r in _mig_conn.execute("SELECT id FROM customers").fetchall()]
         for _cid in _cids:
+            _done_vals = _enum_sql_values('stage', {get_done_stage()})
+            _paid_vals = _enum_sql_values('payment', get_paid_statuses())
             _row = _mig_conn.execute(
-                """SELECT COUNT(*) as cnt, COALESCE(SUM(actual_received), 0) as total
+                f"""SELECT COUNT(*) as cnt, COALESCE(SUM(actual_received), 0) as total
                    FROM orders
                    WHERE customer_id = ?
                      AND is_archived = 1
-                     AND current_stage = '完成'
-                     AND payment_status = '已结算'""",
-                (_cid,)
+                     AND current_stage IN ({','.join('?' * len(_done_vals))})
+                     AND payment_status IN ({','.join('?' * len(_paid_vals))})""",
+                [_cid] + _done_vals + _paid_vals
             ).fetchone()
             _mig_conn.execute(
                 "UPDATE customers SET total_spent = ?, purchase_count = ?, updated_at = datetime('now','localtime') WHERE id = ?",
@@ -482,6 +939,19 @@ def init_db():
     repair_image_consistency()
     # Spec26：清理孤儿收款流水（旧版 exe 删单遗留 / 手动改库防御）
     _cleanup_orphan_payments()
+    # 卡 169 D-3：升级后**首启**即清中文后缀配色键。位置必须在迁移引擎之后：引擎在
+    # 本函数后段才把 user_version 置为 33，且生成型 code（src_NNN/cmt_NNN）的标签
+    # 映射由 seed_choice_items 写入 choice_items —— 两者都就绪判据才准（实测放在
+    # 播种点会被 `_enum_codes_migrated` 拦下，升级后首启漏清、第二次启动才生效）。
+    _cc = get_db()
+    try:
+        if _enum_codes_migrated(_cc):
+            _cleanup_legacy_palette_keys(_cc)
+            _cc.commit()
+    except Exception as e:
+        logger.error('卡169 D-3 配色键清理失败（不阻断启动）: %s', e)
+    finally:
+        _cc.close()
 
 
 def _cleanup_orphan_payments() -> int:
@@ -508,17 +978,17 @@ def _cleanup_orphan_payments() -> int:
 CHOICE_REGISTRY = {
     'stage': {
         'editable': False,  # 系统级，不暴露给设置页
-        'default': '待开始,色稿,线稿,细化,收尾,完成,退单',
+        'default': 'pending,sketch,lineart,detail,finish,completed,cancelled',
         'field': 'current_stage',  # orders 表中的字段名
     },
     'ddl': {
         'editable': False,
-        'default': '正常,即将到期,🔴逾期,已完成✅,已退单',
+        'default': 'normal,due,overdue,done,refund',
         'field': 'ddl_status',
     },
     'payment': {
         'editable': False,  # 系统锁定，不可自定义
-        'default': '已收定金,未收款,已结算,欠款,免收',
+        'default': 'deposit_paid,unpaid,settled,debt,waived',
         'field': 'payment_status',
     },
     'source': {
@@ -534,11 +1004,836 @@ CHOICE_REGISTRY = {
 }
 
 # 需要特殊处理的"已收款"状态（用于收入统计 SQL）
-PAID_STATUSES = {'已结算'}
+# Spec33 卡 160：值空间换 code（D7：两常量分置保留原注释——code 空间下仍拆分）
+PAID_STATUSES = {'settled'}
 
 # P19-F1 归档判定的收款状态集合：与收入统计拆分——
 # 免收单「要归档但不计收入」，故 PAID_STATUSES 保持收入统计专用不动，归档判定用本集合。
-ARCHIVE_PAID_STATUSES = {'已结算', '免收'}
+ARCHIVE_PAID_STATUSES = {'settled', 'waived'}
+
+# ═══════════════════════════════════════════════════════════
+# Spec 33 枚举编码中枢（卡 158 · 纯新增，零行为变化）
+#
+# 三层结构，职责严格分离，**不得互相顶替**：
+#   CODE_TO_LABEL        —— code → 唯一规范显示名（「反查输出」用）
+#   LEGACY_LABEL_TO_CODE —— 任意已知写法 → code（「识别输入」用，一 code 可多别名）
+#   RESERVED_ENUM_CODES  —— 保留字，分宽/严两套判定（见两个判定函数注释）
+#
+# ⚠️ 卡 157 预演实发过两个坑，本节设计正是为规避它们：
+#   1. 别名反查歧义：`🔴逾期` 与 `逾期` 同指 overdue，若拿字典翻转当反查源，
+#      结果取决于哪个键后写入 —— 会把一次正确迁移误判成数据漂移。
+#      故 CODE_TO_LABEL 单独定义，一 code 只有一个显示名，且该值一律等于
+#      **当前线上实际显示串**（`🔴逾期` 表情符在前 / `已完成✅` 在后，
+#      位置不同是历史事实，照抄才能证明 D2「展示层零退化」）。
+#   2. 保留字判据宽严不可混用：M0 迁移预审计用严判据（误拦 = 整个升级被阻断），
+#      新建侧拒绝用宽判据（误拒 = 用户换个名）。
+#
+# 本卡不动 CHOICE_REGISTRY 的 `default` 逗号串（值空间换码属卡 160），
+# 因此全项目行为与本卡之前完全一致。
+# ═══════════════════════════════════════════════════════════
+
+# kind → orders 列名（与 CHOICE_REGISTRY 的键同源）
+ENUM_FIELD = {
+    'stage': 'current_stage',
+    'ddl': 'ddl_status',
+    'payment': 'payment_status',
+    'source': 'source',
+    'commission_type': 'commission_type',
+}
+COLUMN_TO_ENUM_KIND = {v: k for k, v in ENUM_FIELD.items()}
+
+# code → 规范显示名（唯一反查源；字典顺序即下拉展示顺序）
+CODE_TO_LABEL = {
+    'stage': {
+        'pending': '待开始', 'sketch': '色稿', 'lineart': '线稿',
+        'detail': '细化', 'finish': '收尾', 'completed': '完成',
+        'cancelled': '退单',
+    },
+    'ddl': {
+        'normal': '正常', 'due': '即将到期', 'overdue': '\U0001f534逾期',
+        'done': '已完成✅', 'refund': '已退单',
+    },
+    'payment': {
+        'deposit_paid': '已收定金', 'unpaid': '未收款', 'settled': '已结算',
+        'debt': '欠款', 'waived': '免收',
+    },
+    'source': {
+        'mihuashi': '米画师', 'bili': 'B站工坊', 'huajia': '画加',
+        'wechat': '微信', 'qq': 'QQ', 'other': '其他',
+    },
+    'commission_type': {
+        'cmt_001': '单人半身', 'cmt_002': '色稿大头', 'cmt_003': '双人横插',
+        'cmt_004': '立绘', 'cmt_005': '场景插画', 'cmt_006': 'Q版',
+        'cmt_007': '服设', 'cmt_008': '厚涂头像',
+    },
+}
+
+# 任意已知写法 → code（「识别输入」用；**永久冻结，只增不改不删**，
+# 迁移与兼容读都依赖它。一个 code 可有多个别名，但别名绝不能用作反查。）
+LEGACY_LABEL_TO_CODE = {
+    'stage': {
+        '待开始': 'pending', '色稿': 'sketch', '线稿': 'lineart',
+        '细化': 'detail', '收尾': 'finish', '完成': 'completed', '退单': 'cancelled',
+    },
+    'ddl': {
+        '正常': 'normal', '即将到期': 'due',
+        '\U0001f534逾期': 'overdue', '逾期': 'overdue',
+        '已完成✅': 'done', '已完成': 'done',
+        '已退单': 'refund',
+    },
+    'payment': {
+        '已收定金': 'deposit_paid', '未收款': 'unpaid', '已结算': 'settled',
+        '欠款': 'debt', '免收': 'waived',
+        '待收款': 'unpaid',   # 收编 P19-F4 幽灵值（存量 orders 列默认值仍是它）
+    },
+    'source': {
+        '米画师': 'mihuashi', 'B站工坊': 'bili', '画加': 'huajia',
+        '微信': 'wechat', 'QQ': 'qq', '其他': 'other',
+    },
+    'commission_type': {
+        '单人半身': 'cmt_001', '色稿大头': 'cmt_002', '双人横插': 'cmt_003',
+        '立绘': 'cmt_004', '场景插画': 'cmt_005', 'Q版': 'cmt_006',
+        '服设': 'cmt_007', '厚涂头像': 'cmt_008',
+    },
+}
+
+# 系统分配 ID 形态 ^(src|cmt)_\d{3,}$：用户自建值不得长这样
+_ID_CODE_RE = re.compile(r'^(src|cmt)_\d{3,}$')
+
+# **宽**判据保留字：全 kind code ∪ 全部已知旧标签。仅供新建侧拒绝使用。
+RESERVED_ENUM_CODES = frozenset(
+    [c for m in CODE_TO_LABEL.values() for c in m]
+    + [lab for m in LEGACY_LABEL_TO_CODE.values() for lab in m]
+)
+
+
+def column_codes(kind: str) -> frozenset:
+    """本列合法 code 集合（严判据用）。未知 kind → 空集。"""
+    return frozenset(CODE_TO_LABEL.get(kind, {}))
+
+
+def is_reserved_token(value) -> bool:
+    """**宽**判定：值是否占用系统保留字（全 kind code ∪ 旧标签 ∪ ID 形态）。
+
+    用于新建侧拒绝自定义阶段名 / 来源名 / 类别名（spec D17 第 2 层、D18）。
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    return value in RESERVED_ENUM_CODES or bool(_ID_CODE_RE.match(value))
+
+
+def is_ambiguous_in_column(kind: str, value) -> bool:
+    """**严**判定：值与本列某个系统 code 同名，但并非本列可转换的旧标签。
+
+    此时转码后无法区分它是用户自定义值还是系统枚举值 —— 例如客户把阶段命名成
+    `completed`，会被 is_terminal_stage 判真，进而**静默自动归档并计入收入**。
+    迁移预审计 M0 只用本函数；宽判据会把所有未迁移老库都拦死（卡 157 实发）。
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    if value not in CODE_TO_LABEL.get(kind, {}):
+        return False
+    return value not in LEGACY_LABEL_TO_CODE.get(kind, {})
+
+
+def enum_items(kind: str) -> list:
+    """系统枚举项清单 [{'code','label'}, ...]，顺序即展示顺序。"""
+    return [{'code': c, 'label': l} for c, l in CODE_TO_LABEL.get(kind, {}).items()]
+
+
+def enum_label(kind: str, value, with_emoji: bool = True) -> str:
+    """code → 显示名。**未知值原样返回**（直通自定义阶段名 / 历史脏值 / 空值）。
+
+    直通是关键兼容性质：迁移前后、自定义值、恢复的老备份，调用方永远拿得到
+    可显示字符串，既不会看到裸 code 也不会抛错。
+    with_emoji=False 仅对 ddl 有意义（剥掉史实位置的表情符）。
+    """
+    if value is None:
+        return ''
+    table = CODE_TO_LABEL.get(kind, {})
+    label = table.get(value)
+    if label is None:
+        code = LEGACY_LABEL_TO_CODE.get(kind, {}).get(value)
+        label = table[code] if code else str(value)
+    if not with_emoji and kind == 'ddl':
+        label = re.sub(r'[^\w一-鿿]', '', label)
+    return label
+
+
+def enum_code(kind: str, value):
+    """任意已知写法 → code；认不出来返回 None（自定义值无 code）。"""
+    if not isinstance(value, str) or not value:
+        return None
+    codes = CODE_TO_LABEL.get(kind, {})
+    if value in codes:                 # 已是 code
+        return value
+    return LEGACY_LABEL_TO_CODE.get(kind, {}).get(value)
+
+
+def enum_code_or_raw(kind: str, value):
+    """兼容读：能识别成 code 就换，否则**原样返回**。
+
+    ⚠️ 判「是不是 code」靠查表，绝不靠 `[a-z0-9_]` 字符集猜 —— 实测库里有
+    自定义阶段名 `111`、来源 `QQ`、类别字符串 `None`，全是合法 ASCII 形态。
+    """
+    code = enum_code(kind, value)
+    return code if code is not None else value
+
+
+def _enum_sql_values(kind: str, codes) -> list:
+    """SQL IN 子句兼容值：code ∪ 映射到这些 code 的旧中文标签。
+    使 recalc_customer_stats 等裸 SQL 在未迁移/已迁移库上同样工作。"""
+    vals = set(codes)
+    for lab, code in LEGACY_LABEL_TO_CODE.get(kind, {}).items():
+        if code in vals:
+            vals.add(lab)
+    return list(vals)
+
+
+def is_overdue_ddl(value) -> bool:
+    """是否逾期（对未迁移的 `🔴逾期` 与已迁移的 `overdue` 同为真）。"""
+    return enum_code_or_raw('ddl', value) == 'overdue'
+
+
+def is_done_stage(value) -> bool:
+    """是否完成类终态（兼容 `完成` 与 `completed`）。"""
+    return enum_code_or_raw('stage', value) == 'completed'
+
+
+def is_cancelled_stage(value) -> bool:
+    """是否退单类终态（兼容 `退单` 与 `cancelled`）。"""
+    return enum_code_or_raw('stage', value) == 'cancelled'
+
+
+def column_enum_label(column: str, value, with_emoji: bool = True) -> str:
+    """按 orders 列名取显示名（模板过滤器 `|stage_label` 的统一后端）。"""
+    return enum_label(COLUMN_TO_ENUM_KIND.get(column, column), value, with_emoji)
+
+
+# ═══════════════════════════════════════════════════════════
+# Spec 33 来源/稿件类别稳定 ID 数据层（卡 159）
+#
+# 动机（spec D8）：痛点是「改一次名要搬 default_fee_ / cal_source_ / platform_fee_
+# 三类中文配置键」。只有把每来源的附属属性（is_platform / default_fee_pct）
+# 变成**列**才根治 —— settings-JSON 路线只是把中文键换成中文值，改名照样要搬运。
+#
+# ⚠️ 本卡「零行为变化」的边界：四个读函数改走表，但**入参与返回一律仍是 label
+#    （中文显示名）**，值空间换码发生在卡 160/164。故本卡可独立 revert。
+#
+# ⚠️ sort_order 语义：一律按**用户列表原序**排（顺序是用户资产，spec M13）。
+#    内置项只参与「先占码」以保证动态 ID 不抢占内置号段（卡 157 实发缺陷），
+#    **不参与定序**。若把内置项排到最前，升级后下拉顺序会被重排 = 行为变化。
+# ═══════════════════════════════════════════════════════════
+
+_CHOICE_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS choice_items (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind            TEXT NOT NULL,
+    code            TEXT NOT NULL,
+    label           TEXT NOT NULL,
+    is_platform     INTEGER NOT NULL DEFAULT 0,
+    default_fee_pct REAL    NOT NULL DEFAULT 5.0,
+    sort_order      INTEGER NOT NULL DEFAULT 0,
+    is_builtin      INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+    UNIQUE (kind, code)
+)"""
+
+_CHOICE_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_choice_items_kind
+    ON choice_items(kind, sort_order, id)"""
+
+# 刻意**不加** UNIQUE(kind, label)：改名「A↔B 对调」会在中间态撞唯一索引而死锁；
+# 标签唯一性放到服务层（add/rename 各自查重并返回用户可读错误）。
+
+# 卡 168：迁移前本键存的是中文标签序，是「用户排好的顺序」的唯一来源，
+# M13 删键后顺序只认 choice_items.sort_order（seed 不再覆写）。
+_CHOICE_LIST_KEY = {'source': 'source_list', 'commission_type': 'commission_type_list'}
+_CHOICE_ID_PREFIX = {'source': 'src', 'commission_type': 'cmt'}
+
+# 卡 168：platform_sources 键随 T168.4 一并删除，全新库的平台标记靠本常量播种
+# （取自卡 168 之前 `_ensure_default_settings` 里该键的老默认值
+# `米画师,B站工坊,画加` —— 少了 mihuashi 会让全新库的平台单手续费静默归零）；
+# 既有库靠 choice_items.is_platform 列自身承载。
+BUILTIN_PLATFORM_CODES = frozenset({'mihuashi', 'bili', 'huajia'})
+
+
+def ensure_choice_items_table(conn=None) -> None:
+    """建表 + 建索引（幂等）。conn 传入时在既有事务内执行，不自开连接。"""
+    own = conn is None
+    if own:
+        conn = get_db()
+    conn.execute(_CHOICE_TABLE_DDL)
+    conn.execute(_CHOICE_INDEX_DDL)
+    if own:
+        conn.commit()
+        conn.close()
+
+
+def _next_choice_code(conn, kind: str) -> str:
+    """分配 `src_%03d`/`cmt_%03d`：跳过内置号段，且跳过已存在行。
+
+    ⚠️ 卡 157 预演实发的致命缺陷：原实现只取 MAX+1，当用户自建项先于内置项落库时
+    会把内置号段抢走（实测 `半身` 拿走 `cmt_005` = 场景插画的位置），随后内置项
+    `INSERT OR IGNORE` 静默跳过 → 两个类别共用一个 code，
+    cal_commission_* 颜色键互相覆盖。**客户会在升级后发现类别颜色莫名改变。**
+    """
+    taken = set(CODE_TO_LABEL.get(kind, {}))
+    row = conn.execute(
+        'SELECT MAX(CAST(substr(code, 5) AS INTEGER)) FROM choice_items WHERE kind=?',
+        (kind,)).fetchone()
+    n = (row[0] or 0) + 1
+    prefix = _CHOICE_ID_PREFIX[kind]
+    while True:
+        cand = f'{prefix}_{n:03d}'
+        if cand in taken or conn.execute(
+                'SELECT 1 FROM choice_items WHERE kind=? AND code=?',
+                (kind, cand)).fetchone():
+            n += 1
+            continue
+        return cand
+
+
+def _upsert_choice_item(conn, kind: str, code: str, label: str,
+                        sort_order: int, is_builtin: int,
+                        is_platform: int = 0) -> None:
+    """仅在 (kind,code) 不存在时按传入值插入；已存在则什么都不改。
+
+    卡 168：旧实现用 ON CONFLICT 覆写 label/sort_order/is_builtin，等于每次建表
+    都把用户排好的顺序、改过的名称、勾好的平台标记倒推回注册表默认值（实测
+    来源顺序被重排、平台标记反复回滚）。用户侧属性一律归用户，启动只做补行。
+    同名 label 冲突（同 code 已属别的 label）仍炸出 —— 改名走 `rename_choice_item`。
+    """
+    row = conn.execute('SELECT label FROM choice_items WHERE kind=? AND code=?',
+                       (kind, code)).fetchone()
+    if row is not None:
+        if row[0] != label:
+            # 不再静默覆盖 —— 颜色键与费率会随 code 归属走，覆盖即数据丢失
+            raise RuntimeError(
+                f'choice_items 冲突：{kind} 的 {code} 已属 {row[0]!r}，拒绝改判给 {label!r}')
+        return
+    conn.execute(
+        'INSERT INTO choice_items (kind, code, label, sort_order, is_builtin, is_platform) '
+        'VALUES (?,?,?,?,?,?)',
+        (kind, code, label, sort_order, is_builtin, 1 if is_platform else 0))
+
+
+def _insert_choice_item_if_missing(conn, kind: str, code: str, label: str,
+                                  sort_order: int, is_builtin: int,
+                                  is_platform: int = 0) -> bool:
+    """仅在 (kind,code) 不存在时插入；既有行的 label / sort_order / 标记一律不动。
+
+    卡 168：seed 专用。既有行代表用户确认过的顺序与显示名（可能已改名），
+    每次启动都不该被注册表默认值覆写，也不能因改名而抛冲突异常。
+    与 `_upsert_choice_item` 的差别正是「不改名也不炸」。
+    """
+    row = conn.execute('SELECT 1 FROM choice_items WHERE kind=? AND code=?',
+                       (kind, code)).fetchone()
+    if row is not None:
+        return False
+    conn.execute(
+        'INSERT INTO choice_items (kind, code, label, sort_order, is_builtin, is_platform) '
+        'VALUES (?,?,?,?,?,?)',
+        (kind, code, label, sort_order, is_builtin, 1 if is_platform else 0))
+    return True
+
+
+def apply_legacy_source_settings(conn) -> int:
+    """把 settings 里**仍残存**的 `platform_sources` / `default_fee_<label>` 落到
+    choice_items 的 is_platform / default_fee_pct 列。返回应用的键数。
+
+    ⚠️ 「键存在才应用」是本函数的幂等基石，也是它能同时服务卡 159 与卡 165 的原因：
+      - 卡 159-164 阶段：settings 键还在 → 每次 seed 都按 settings 覆盖列（结果恒定）
+      - 卡 165 之后：M11/M12 已删这些键 → 本函数无操作，**不会把用户后来在设置页
+        改过的列值倒退回历史 settings 值**
+
+    卡 159 实测教训：漏掉这一步会让 is_platform 全为 0，`get_platform_sources()`
+    返回空集 → 所有平台单手续费静默归零。
+
+    ⚠️ 只搬 is_platform 门内的东西不等于放过非平台来源的 default_fee_ 惰性值 ——
+    实测库里 `default_fee_微信` 之类确实存在，全靠 `get_default_fee_for_source`
+    的先查平台门才没生效。这里照搬进列（值保留），门仍在读函数上，语义一字不变。
+    """
+    applied = 0
+    prow = conn.execute("SELECT value FROM settings WHERE key='platform_sources'").fetchone()
+    if prow:
+        plats = {x.strip() for x in (prow[0] or '').split(',') if x.strip()}
+        for row in conn.execute('SELECT code, label FROM choice_items '
+                                "WHERE kind='source'").fetchall():
+            want = 1 if row['label'] in plats else 0
+            cur = conn.execute('SELECT is_platform FROM choice_items WHERE code=?',
+                               (row['code'],)).fetchone()
+            if cur and cur[0] != want:
+                conn.execute('UPDATE choice_items SET is_platform=? WHERE code=?',
+                             (want, row['code']))
+                applied += 1
+        # settings 里有平台名但表内无对应行（新导入的自定义来源）→ 兜底补标
+        for lbl in plats:
+            fixed = LEGACY_LABEL_TO_CODE['source'].get(lbl)
+            if fixed:
+                conn.execute('UPDATE choice_items SET is_platform=1 '
+                             "WHERE kind='source' AND code=?", (fixed,))
+    for srow in conn.execute("SELECT key, value FROM settings "
+                             "WHERE key LIKE 'default_fee_%'").fetchall():
+        lbl = srow[0][len('default_fee_'):]
+        try:
+            fee = float(srow[1] or 5)
+        except (TypeError, ValueError):
+            continue
+        crow = conn.execute('SELECT code, default_fee_pct FROM choice_items '
+                            "WHERE kind='source' AND label=?", (lbl,)).fetchone()
+        if crow and float(crow['default_fee_pct']) != fee:
+            conn.execute('UPDATE choice_items SET default_fee_pct=? WHERE code=?',
+                         (fee, crow['code']))
+            applied += 1
+    if applied:
+        logger.info('choice_items 应用 settings 残存平台/费率 %d 项', applied)
+    return applied
+
+
+def dedup_choice_items(conn) -> int:
+    """同 (kind,label) 多行时保留最小 id 那行，删除其余，并迁移已引用它的数据。
+
+    本卡首次实现的缺陷会在开发库留下重复行，这里做一次自愈清理；
+    因 orders.* 此刻仍是中文 label 空间（值空间换码在卡 160/164），
+    删多余 code 不影响任何订单数据。
+    """
+    removed = 0
+    for kind in ('source', 'commission_type'):
+        groups = conn.execute(
+            'SELECT label, COUNT(*) n, MIN(id) keep_id FROM choice_items '
+            'WHERE kind=? GROUP BY label HAVING n > 1', (kind,)).fetchall()
+        for g in groups:
+            dupes = conn.execute(
+                'SELECT code FROM choice_items WHERE kind=? AND label=? AND id!=?',
+                (kind, g['label'], g['keep_id'])).fetchall()
+            for d in dupes:
+                prefix = {'source': 'cal_source_',
+                          'commission_type': 'cal_commission_'}[kind]
+                conn.execute('DELETE FROM settings WHERE key=?', (prefix + d[0],))
+                cur = conn.execute('DELETE FROM choice_items WHERE kind=? AND code=?',
+                                   (kind, d[0]))
+                removed += cur.rowcount
+    if removed:
+        logger.info('choice_items 去重：删除 %d 个重复行', removed)
+    return removed
+
+
+def purge_code_named_items(conn) -> int:
+    """清理「label 恰等于本 kind 另一行 code」的伪行，返回删除数。
+
+    卡 165 迁移后 seed 把 orders 列里的英文码当 label 重新登记，每启动一次多一批
+    （实测 source `src_002..src_007` / commission `cmt_017..cmt_024` 共 14 行，
+    第二代还出现 `src_007` 的 label = `'src_001'` 这种链式污染）。
+
+    ⚠️ 判据故意收窄到「label 命中已有 code」+「orders 无引用」两条同时成立：
+    真实数据里确实存在名叫 `QQ`（11 单）/`None`（2 单）的类别与名叫 `行书` 的来源，
+    它们只是「名字长得像代码或怪」，不是伪行 —— 逐值核对 `orders.pre-v1.5.0.db` 确认。
+    """
+    removed = 0
+    for kind, column in (('source', 'source'), ('commission_type', 'commission_type')):
+        # 先一次性取全，避免边删边判导致链式伪行（label 指向另一伪行 code）漏网
+        rows = conn.execute(
+            'SELECT c1.code FROM choice_items c1 WHERE c1.kind=? AND c1.code != c1.label '
+            'AND EXISTS (SELECT 1 FROM choice_items c2 WHERE c2.kind=c1.kind '
+            'AND c2.code=c1.label)', (kind,)).fetchall()
+        prefix = 'cal_source_' if kind == 'source' else 'cal_commission_'
+        for r in rows:
+            code = r[0]
+            ref = conn.execute(
+                f'SELECT COUNT(*) FROM orders WHERE {column}=?', (code,)).fetchone()[0]
+            if ref:
+                logger.warning('伪行 %s/%s 被 %d 个订单引用，保留（防数据丢失）',
+                               kind, code, ref)
+                continue
+            conn.execute('DELETE FROM settings WHERE key=?', (prefix + code,))
+            conn.execute('DELETE FROM choice_items WHERE kind=? AND code=?', (kind, code))
+            removed += 1
+    if removed:
+        logger.info('choice_items 清理伪行 %d 个（label 命中本 kind 已知 code）', removed)
+    return removed
+
+
+def seed_choice_items(conn) -> dict:
+    """幂等播种两类可编辑枚举，返回 {kind: {label: code}}。
+
+    卡 168 起只做两件事：**补缺失的行** + **补登记 orders 里仍未被认识的用户值**。
+    既有行的 label / sort_order / is_platform 一律不碰（旧实现每次启动都按注册表
+    默认值覆写，实测把用户排好的来源顺序重排、平台标记回滚，且把 orders 里的英文码
+    当成新用户值反复登记，每启动一次多一批假选项）。
+
+    本函数即卡 165 的 M13 复用体，迁移与常态播种共用一份实现（禁止两处各写）：
+    迁移期 `settings[source_list]` 还带着用户原序，用它定序；迁移后键已删，
+    顺序只认 `choice_items.sort_order`。
+    """
+    ensure_choice_items_table(conn)
+    dedup_choice_items(conn)          # 先自愈历史重复行，再按 label 复用码
+    purge_code_named_items(conn)      # 再清「码当名」的伪行（卡 168）
+    out = {}
+    for kind, column in (('source', 'source'), ('commission_type', 'commission_type')):
+        builtin = list(CODE_TO_LABEL.get(kind, {}))          # 注册表内置序
+        builtin_labels = [CODE_TO_LABEL[kind][c] for c in builtin]
+        fixed = {label: code for code, label in CODE_TO_LABEL[kind].items()}
+
+        # 迁移期用户原序（键已被 M13 删除后为空）
+        srow = conn.execute('SELECT value FROM settings WHERE key=?',
+                            (_CHOICE_LIST_KEY[kind],)).fetchone()
+        listed = [x.strip() for x in (srow[0] or '').split(',') if x.strip()] if srow else []
+        try:
+            drows = conn.execute(
+                f'SELECT DISTINCT {column} FROM orders '
+                f"WHERE {column} IS NOT NULL AND {column} != ''").fetchall()
+            db_vals = [r[0] for r in drows]
+        except Exception:
+            db_vals = []
+
+        # 存量行：用户已确认的顺序与显示名，本函数绝不改写
+        existing = {r['label']: r['code'] for r in conn.execute(
+            'SELECT code, label FROM choice_items WHERE kind=?', (kind,)).fetchall()}
+        existing_codes = set(existing.values())
+        first_run = not existing              # 首次安装 / 迁移中：表还是空的
+        next_sort = (conn.execute('SELECT COALESCE(MAX(sort_order), -1) FROM choice_items '
+                                  'WHERE kind=?', (kind,)).fetchone()[0] or -1) + 1
+
+        seq, seen = [], set()
+
+        def _add(lbl):
+            if lbl and lbl not in seen:
+                seen.add(lbl)
+                seq.append(lbl)
+
+        for lbl in listed:                            # ① 迁移期用户原序优先
+            _add(lbl)
+        if first_run:
+            # ② 只在空表时补内置项 —— 否则用户从设置页删掉的来源/类别会被启动复活
+            for lbl in builtin_labels:
+                _add(lbl)
+        for v in db_vals:                             # ③ 库内值：认得的跳过，认不得的登记
+            if not v or v in existing_codes or enum_code(kind, v) is not None:
+                continue
+            _add(v)
+
+        mapping = {}
+        for lbl in seq:
+            code = fixed.get(lbl) or existing.get(lbl)
+            if code is None:
+                code = _next_choice_code(conn, kind)
+            # 内置项也必须落行（全新库靠这里播种）；既有行不改 label/sort_order/标记
+            is_plat = 1 if (kind == 'source' and lbl in
+                            {CODE_TO_LABEL['source'].get(c, c)
+                             for c in BUILTIN_PLATFORM_CODES}) else 0
+            if _insert_choice_item_if_missing(conn, kind, code, lbl, next_sort,
+                                              1 if lbl in fixed else 0, is_plat):
+                next_sort += 1
+            mapping[lbl] = code
+        out[kind] = mapping
+        logger.info('choice_items seed %s：%d 项（内置 %d）',
+                    kind, len(seq), len(fixed))
+    # 平台标记与费率必须紧随播种应用，否则 is_platform 全 0 → 手续费静默归零
+    apply_legacy_source_settings(conn)
+    return out
+
+
+def get_choice_rows(kind: str) -> list:
+    """按 sort_order 读全部行 [{'code','label','is_platform','default_fee_pct',...}]。"""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            'SELECT code, label, is_platform, default_fee_pct, sort_order, is_builtin '
+            'FROM choice_items WHERE kind=? ORDER BY sort_order, id', (kind,)).fetchall()
+    except Exception as e:                       # 表尚未建（老库首次导入期）
+        logger.error('get_choice_rows(%s) 失败：%s', kind, e)
+        rows = []
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_user_choice_items(kind: str) -> list:
+    """用户可编辑枚举（source/commission_type）的界面契约：[{'code','label',...}]。
+
+    表为空时回退注册表内置序。界面一律消费本函数的 code+label 双值，
+    不再拿裸字符串自己猜是码还是中文。
+    """
+    rows = get_choice_rows(kind)
+    if rows:
+        return rows
+    return [{'code': c, 'label': l, 'is_platform': 0, 'default_fee_pct': 5.0,
+             'sort_order': i, 'is_builtin': 1}
+            for i, (c, l) in enumerate(CODE_TO_LABEL.get(kind, {}).items())]
+
+
+def choice_codes(kind: str) -> list:
+    """本 kind 全部 code（按 sort_order）。"""
+    return [r['code'] for r in get_user_choice_items(kind)]
+
+
+def choice_label(kind: str, code) -> str:
+    """code → 显示名；查不到（老库未迁移值 / 空）原样返回。"""
+    if not code:
+        return ''
+    for r in get_choice_rows(kind):
+        if r['code'] == code:
+            return r['label']
+    return str(code)
+
+
+def resolve_choice_code(kind: str, token):
+    """入参归一：**code 优先，其次 label**；都认不出返回 None。
+
+    让 URL 书签、旧前端缓存、手工 curl 提交的老中文值都能落到新值空间。
+    """
+    if not isinstance(token, str) or not token:
+        return None
+    rows = get_choice_rows(kind)
+    for r in rows:
+        if r['code'] == token:
+            return token
+    for r in rows:
+        if r['label'] == token:
+            return r['code']
+    return None
+
+
+def _ensure_choice_code_conn(conn, kind: str, token):
+    """`ensure_choice_code` 的事务内版本：在**调用方连接**上查/建行，不自开事务。
+
+    返回已登记的 code；无法登记（空/非串/保留字）时返回 None。
+    """
+    if not isinstance(token, str) or not token:
+        return None
+    code = enum_code(kind, token)
+    if code is not None:
+        return code
+    hit = resolve_choice_code(kind, token)
+    if hit is not None:
+        return hit
+    if is_reserved_token(token):
+        return None
+    ensure_choice_items_table(conn)
+    row = conn.execute('SELECT code FROM choice_items WHERE kind=? AND label=? '
+                       'ORDER BY id LIMIT 1', (kind, token)).fetchone()
+    if row is not None:
+        return row[0]
+    code = _next_choice_code(conn, kind)
+    srow = conn.execute('SELECT COALESCE(MAX(sort_order), -1) FROM choice_items '
+                        'WHERE kind=?', (kind,)).fetchone()
+    _upsert_choice_item(conn, kind, code, token, (srow[0] or 0) + 1, 0)
+    return code
+
+
+def ensure_choice_code(kind: str, token) -> str:
+    """写入侧用户枚举归一：**认得就返回 code，认不出就登记新行再返回 code**。
+
+    卡 164 只做了被动一半（`enum_code_or_raw` 不认就原样透传），于是用户新填的
+    来源/类别以中文原样落进 orders 列，界面按 code 反查不到中文。本函数补上登记
+    那一半 —— 使 orders 的用户枚举列**永远只有 code**。
+
+    预留字 / 空值 / 非字符串按卡 164 口径原样返回，交给上层校验拒绝或忽略。
+    """
+    if not isinstance(token, str) or not token:
+        return token
+    code = enum_code(kind, token)
+    if code is None:
+        code = resolve_choice_code(kind, token)
+    if code is not None:
+        return code
+    if is_reserved_token(token):
+        return token
+    with transaction() as conn:
+        code = _ensure_choice_code_conn(conn, kind, token)
+    _invalidate_choices_cache()
+    return code or token
+
+
+def add_choice_item(kind: str, label: str) -> dict:
+    """新建可编辑项。label 去空白后非空且不与现有 label/code 冲突，否则 ValueError。"""
+    label = (label or '').strip()
+    if not label:
+        raise ValueError('名称不能为空')
+    if is_reserved_token(label):
+        raise ValueError(f'「{label}」是系统保留名称，请换一个')
+    with transaction() as conn:
+        ensure_choice_items_table(conn)
+        row = conn.execute('SELECT 1 FROM choice_items WHERE kind=? AND label=?',
+                           (kind, label)).fetchone()
+        if row:
+            raise ValueError(f'「{label}」已存在')
+        code = _next_choice_code(conn, kind)
+        srow = conn.execute('SELECT COALESCE(MAX(sort_order), -1) FROM choice_items '
+                            'WHERE kind=?', (kind,)).fetchone()
+        _upsert_choice_item(conn, kind, code, label, (srow[0] or 0) + 1, 0)
+    _invalidate_choices_cache()
+    return {'code': code, 'label': label}
+
+
+def rename_choice_item(kind: str, code: str, new_label: str) -> int:
+    """**只改 label 列** —— 这就是 ID 方案的全部意义：改名零搬运。
+
+    orders 列值、cal_* / default_fee 配置一律不动。返回受影响订单行数（恒为 0）。
+    """
+    new_label = (new_label or '').strip()
+    if not new_label:
+        raise ValueError('名称不能为空')
+    with transaction() as conn:
+        dup = conn.execute('SELECT 1 FROM choice_items WHERE kind=? AND label=? '
+                           'AND code!=?', (kind, new_label, code)).fetchone()
+        if dup:
+            raise ValueError(f'「{new_label}」已存在')
+        cur = conn.execute('UPDATE choice_items SET label=?, '
+                           "updated_at=datetime('now','localtime') "
+                           'WHERE kind=? AND code=?', (new_label, kind, code))
+        if cur.rowcount == 0:
+            raise ValueError(f'未找到 {kind}/{code}')
+    _invalidate_choices_cache()
+    return 0
+
+
+def delete_choice_item(kind: str, code: str) -> None:
+    """删除项及其 cal_<mode>_<code> 颜色键（费率/平台标记随行消失，无需搬运）。"""
+    with transaction() as conn:
+        conn.execute('DELETE FROM choice_items WHERE kind=? AND code=?', (kind, code))
+        prefix = {'source': 'cal_source_', 'commission_type': 'cal_commission_'}[kind]
+        conn.execute('DELETE FROM settings WHERE key=?', (prefix + code,))
+    _invalidate_choices_cache()
+
+
+_CAL_PREFIX_BY_KIND = {'source': 'cal_source_', 'commission_type': 'cal_commission_'}
+
+
+def _fuzzy_label_key(text: str) -> str:
+    """去非文字非中日韩字符后的比较键（沿用 sync_choice_renames 的老口径）。"""
+    return re.sub(r'[^\w一-鿿]', '', text or '')
+
+
+def reconcile_choice_list(conn, kind: str, tokens, confirmed_deletes=None) -> dict:
+    """把 choice_items 对齐到设置页提交的清单 —— **提交清单就是唯一事实源**。
+
+    取代 sync_choice_renames（模糊改名改 orders 值）+ apply_source_deletions 的清单部分：
+    卡 168 起用户枚举以 code 存储，改名只该动 `choice_items.label`，订单列一律不搬。
+    tokens 允许 code 或 label 混排（新建项在前端还没有 code），提交顺序即 sort_order。
+    未被提交的既有行：
+      ① 去符号后与某个提交项唯一同名 → 认定是改名，只改 label、code 保留（配置零搬运）；
+      ② 否则删行 + 清 `cal_<mode>_<code>`；
+      ③ 但被订单引用时先看确认清单 —— 已确认则把 orders 列置空再删，未确认则保留并补回
+         清单末尾（D9 防误删，原 apply_source_deletions 的语义）。
+    ⚠️ 改名判定必须在「登记新行」**之前**：否则提交「微 信」（库里是「微信」）会先建出
+    一行同名新行、再给旧行改名，白得一行重复 label + 一个多余的 src_NNN 码。
+    在调用方事务内执行，不 commit。返回 {'codes','renamed','deleted','kept','nulled'}。
+    """
+    prefix = _CAL_PREFIX_BY_KIND[kind]
+    column = CHOICE_REGISTRY[kind]['field']
+    tokens = [t.strip() for t in (tokens or []) if isinstance(t, str) and t.strip()]
+    confirmed = {x.strip() for x in (confirmed_deletes or []) if isinstance(x, str) and x.strip()}
+
+    rows = [dict(r) for r in conn.execute(
+        'SELECT id, code, label FROM choice_items WHERE kind=? ORDER BY sort_order, id',
+        (kind,)).fetchall()]
+    by_code = {r['code']: r for r in rows}
+    by_label = {r['label']: r for r in rows}
+    by_fuzzy: dict = {}
+    for r in rows:
+        by_fuzzy.setdefault(_fuzzy_label_key(r['label']), []).append(r)
+
+    renamed, deleted, kept, nulled = {}, [], [], []
+    ordered, seen = [], set()
+    for t in tokens:
+        r = by_code.get(t) or by_label.get(t)
+        if r is None:
+            # 先去符号后同名 → 改名（唯一未认领者）；认不出才是真新值
+            cand = [c for c in by_fuzzy.get(_fuzzy_label_key(t), []) if c['code'] not in seen]
+            if cand:
+                r = cand[0]
+                if r['label'] != t:
+                    conn.execute("UPDATE choice_items SET label=?, "
+                                 "updated_at=datetime('now','localtime') "
+                                 'WHERE kind=? AND code=?', (t, kind, r['code']))
+                    renamed[r['code']] = (r['label'], t)
+                    r = dict(r, label=t)
+            else:
+                code = _ensure_choice_code_conn(conn, kind, t)
+                if not code:
+                    continue
+                r = {'code': code, 'label': t}
+        if r['code'] not in seen:
+            seen.add(r['code'])
+            ordered.append((r['code'], r['label']))
+
+    for r in rows:
+        if r['code'] in seen:
+            continue
+        refs = conn.execute(
+            f'SELECT id FROM orders WHERE {column} = ?', (r['code'],)).fetchall()
+        if refs:
+            if r['code'] in confirmed:
+                conn.execute(f'UPDATE orders SET {column} = \'\' WHERE {column} = ?', (r['code'],))
+                nulled.append(r['code'])
+            else:
+                kept.append(r['code'])
+                ordered.append((r['code'], r['label']))
+                continue
+        conn.execute('DELETE FROM settings WHERE key=?', (prefix + r['code'],))
+        conn.execute('DELETE FROM choice_items WHERE kind=? AND code=?', (kind, r['code']))
+        deleted.append(r['code'])
+
+    for i, (code, _lbl) in enumerate(ordered):
+        conn.execute('UPDATE choice_items SET sort_order=? WHERE kind=? AND code=?',
+                     (i, kind, code))
+    if deleted or renamed or nulled:
+        logger.info('choice_items reconcile %s：改 %d / 删 %d / 置空 %d / 保护 %d',
+                    kind, len(renamed), len(deleted), len(nulled), len(kept))
+    return {'codes': [c for c, _ in ordered], 'renamed': renamed,
+            'deleted': deleted, 'kept': kept, 'nulled': nulled}
+
+
+def set_source_platform_fees(conn, platform_tokens, fee_map) -> int:
+    """按设置页提交更新来源的平台标记与默认费率（两族 settings 键的替代物）。
+
+    platform_tokens 未提交（None）时不动标记；提交的是**勾选框 value**，允许 code
+    或 label（用 `resolve_choice_code` 归一）。fee_map 的键同理（旧版是
+    `default_fee_<中文名>` 表单键，卡 168 起模板改 `default_fee_<code>`，解析器两种都认）。
+    未出现的行保持原费率（表单每行都带 default_fee_<x>，正常情况下是全量）。
+    在调用方事务内执行，不 commit。返回改动行数。
+    """
+    changed = 0
+    if platform_tokens is not None:
+        marks = set()
+        for t in platform_tokens:
+            code = resolve_choice_code('source', t.strip() if isinstance(t, str) else t)
+            if code:
+                marks.add(code)
+        changed += conn.execute(
+            "UPDATE choice_items SET is_platform=CASE WHEN code IN "
+            f"({','.join('?' * len(marks)) or 'NULL'}) THEN 1 ELSE 0 END "
+            "WHERE kind='source'", tuple(marks)).rowcount
+    for token, fee in (fee_map or {}).items():
+        code = resolve_choice_code('source', token.strip() if isinstance(token, str) else token)
+        if not code:
+            continue
+        try:
+            val = float(fee if fee not in (None, '') else 5.0)
+        except (TypeError, ValueError):
+            continue
+        changed += conn.execute(
+            "UPDATE choice_items SET default_fee_pct=?, updated_at=datetime('now','localtime') "
+            "WHERE kind='source' AND code=?", (val, code)).rowcount
+    return changed
+
+
+def set_source_flags(code: str, is_platform, fee_pct) -> None:
+    """写来源的平台标记与默认费率（取代 platform_sources / default_fee_<中文> 两族键）。"""
+    try:
+        fee = float(fee_pct if fee_pct not in (None, '') else 5.0)
+    except (TypeError, ValueError):
+        fee = 5.0
+    with transaction() as conn:
+        conn.execute('UPDATE choice_items SET is_platform=?, default_fee_pct=?, '
+                     "updated_at=datetime('now','localtime') "
+                     "WHERE kind='source' AND code=?",
+                     (1 if is_platform else 0, fee, code))
+    _invalidate_choices_cache()
+
 
 # Spec 26 收款容差与笔数上限（D12② / §3.2）：
 # 3000+2000 类浮点组合的 Σ笔 与应收判定统一按 ±0.01；笔数上限防误操作轰炸。
@@ -636,10 +1931,17 @@ def check_data_recovery_needed() -> bool:
         return False
 
 
+# 卡 183 D1：备份文件名时间戳 orders_backup_YYYYMMDD_HHMMSS.db（_do_backup 生成）
+_BACKUP_TS_RE = re.compile(r'^orders_backup_(\d{8}_\d{6})\.db$')
+
+
 def get_backup_list() -> list:
     """遍历 get_backup_dir() 内 orders_backup_*.db，按文件名倒序。
-    每条: {'name','size','mtime','orders','customers'}；
-    单条损坏/不可读跳过；无目录返回 []。
+    每条: {'name','size','mtime','orders','customers','readable','time','time_source'}。
+    time 为显示用备份时间：优先解析文件名时间戳（time_source='filename'），
+    不符命名/日期非法回退文件 mtime（time_source='mtime'）；mtime 恒为真实文件修改时间，
+    不改写既有备份文件属性。计数读取失败的损坏备份 readable=False 且计数为 None
+    （不使用 -1 哨兵），仍保留在列表中由前端标注不可用；无目录返回 []。
     """
     backup_dir = get_backup_dir()
     if not os.path.isdir(backup_dir):
@@ -654,28 +1956,47 @@ def get_backup_list() -> list:
         fpath = os.path.join(backup_dir, fname)
         try:
             stat = os.stat(fpath)
-            size_kb = round(stat.st_size / 1024, 1)
-            mtime = datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M')
-            # 临时只读连接统计行数
-            ro_conn = sqlite3.connect(f'file:{fpath}?mode=ro', uri=True)
-            ro_conn.row_factory = sqlite3.Row
-            try:
-                orders = ro_conn.execute('SELECT COUNT(*) FROM orders').fetchone()[0]
-                customers = ro_conn.execute('SELECT COUNT(*) FROM customers').fetchone()[0]
-            except Exception:
-                orders = customers = -1
-            finally:
-                ro_conn.close()
-            result.append({
-                'name': fname,
-                'size': size_kb,
-                'mtime': mtime,
-                'orders': orders,
-                'customers': customers,
-            })
-        except Exception as e:
+        except OSError as e:
             logger.error('备份文件 %s 不可读: %s', fname, e)
             continue
+        size_kb = round(stat.st_size / 1024, 1)
+        mtime = datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M')
+        display_time, time_source = mtime, 'mtime'
+        ts_match = _BACKUP_TS_RE.match(fname)
+        if ts_match:
+            try:
+                display_time = datetime.strptime(
+                    ts_match.group(1), '%Y%m%d_%H%M%S'
+                ).strftime('%Y-%m-%d %H:%M')
+                time_source = 'filename'
+            except ValueError:
+                pass
+        # 临时只读连接统计行数；失败 → 显式标记不可读（卡 182 D2）
+        orders = customers = None
+        readable = True
+        ro_conn = None
+        try:
+            ro_conn = sqlite3.connect(f'file:{fpath}?mode=ro', uri=True)
+            ro_conn.row_factory = sqlite3.Row
+            orders = ro_conn.execute('SELECT COUNT(*) FROM orders').fetchone()[0]
+            customers = ro_conn.execute('SELECT COUNT(*) FROM customers').fetchone()[0]
+        except Exception as e:
+            readable = False
+            orders = customers = None
+            logger.error('备份文件 %s 计数读取失败: %s', fname, e)
+        finally:
+            if ro_conn is not None:
+                ro_conn.close()
+        result.append({
+            'name': fname,
+            'size': size_kb,
+            'mtime': mtime,
+            'time': display_time,
+            'time_source': time_source,
+            'orders': orders,
+            'customers': customers,
+            'readable': readable,
+        })
     return result
 
 
@@ -704,44 +2025,155 @@ def delete_backup(filename):
         return (False, str(e))
 
 
-def restore_backup(filename):
-    """从备份恢复：basename 校验防穿越 + 保护性备份 + copy2 + init_db 重跑迁移。
-    返回 (True, 消息) 或 (False, 错误信息)。
+def _validate_sqlite_file(file_path: str) -> tuple[bool, str]:
+    """校验文件是否为可正常读取的 SQLite 数据库（只读，不改文件、不建表、不迁移）。
+
+    卡 172 D172.1：前 16 字节须严格等于 `SQLite format 3\\0`，再以只读连接执行
+    `PRAGMA quick_check` 且唯一结果为 ok。不检查 orders/settings 等业务表，
+    因此其他软件生成的结构完整 SQLite 也会通过——能否被 init_db 补齐由初始化流程决定。
+    返回 (True, '') 或 (False, 稳定且可面向用户的错误信息)。
     """
     try:
-        # 校验：防路径穿越
-        if os.path.basename(filename) != filename:
-            return (False, '非法文件名')
-        if not filename.startswith('orders_backup_') or not filename.endswith('.db'):
-            return (False, '非法文件名')
-        backup_dir = get_backup_dir()
-        src = os.path.join(backup_dir, filename)
-        if not os.path.isfile(src):
-            return (False, '备份文件不存在')
-        # 恢复前对当前库做一次保护性备份（哪怕空库也留后悔药）
-        if os.path.isfile(DB_PATH):
-            try:
-                _do_backup()
-            except Exception as e:
-                logger.error('恢复前保护性备份失败: %s', e)
-        # 覆盖
-        shutil.copy2(src, DB_PATH)
-        # 重跑 init_db 幂等迁移（为旧备份补列）
+        with open(file_path, 'rb') as f:
+            header = f.read(16)
+        if header != b'SQLite format 3\x00':
+            return (False, '不是有效的 SQLite 数据库文件')
+    except OSError as e:
+        logger.error('读取候选文件头失败 %s: %s', file_path, e)
+        return (False, '文件无法读取')
+
+    conn = None
+    try:
+        conn = sqlite3.connect(f'file:{file_path}?mode=ro', uri=True)
+        rows = conn.execute('PRAGMA quick_check').fetchall()
+        if len(rows) == 1 and str(rows[0][0]).lower() == 'ok':
+            return (True, '')
+        detail = '; '.join(str(r[0]) for r in rows[:3]) if rows else '未知错误'
+        logger.error('完整性校验未通过 %s: %s', file_path, detail)
+        return (False, '数据库完整性校验未通过')
+    except sqlite3.Error as e:
+        logger.error('SQLite 校验失败 %s: %s', file_path, e)
+        return (False, '数据库无法打开或已损坏')
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _remove_tmp_and_sidecars(tmp_path: str) -> None:
+    """删除临时库文件及其 -wal/-shm 边车（只读校验 WAL 格式库会产生边车；
+    主文件被 os.replace 消费后边车仍可能孤儿残留，故三者都尝试删）。"""
+    if not tmp_path:
+        return
+    for p in (tmp_path, tmp_path + '-wal', tmp_path + '-shm'):
+        try:
+            if os.path.exists(p):
+                os.remove(p)
+        except OSError as e:
+            logger.error('清理临时文件失败 %s: %s', p, e)
+
+
+def _rollback_to_protective(protective_path: str, db_dir: str) -> bool:
+    """把本次保护性备份复制回 DB_PATH 并重跑 init_db；成功返回 True。
+
+    任一环节（无保护备份 / 复制 / 校验 / 替换 / 初始化）失败均记日志并返回 False，
+    调用方据此告知用户人工处理，不得声称数据已恢复。临时文件在 finally 清理。
+    """
+    if not protective_path or not os.path.isfile(protective_path):
+        logger.error('自动回滚失败：无可用保护性备份')
+        return False
+    tmp_path = ''
+    try:
+        fd, tmp_path = tempfile.mkstemp(dir=db_dir, prefix='.rollback_', suffix='.db')
+        os.close(fd)
+        shutil.copy2(protective_path, tmp_path)
+        ok, err = _validate_sqlite_file(tmp_path)
+        if not ok:
+            logger.error('回滚副本校验失败 %s: %s', tmp_path, err)
+            return False
+        os.replace(tmp_path, DB_PATH)
+        # 保留 tmp_path 供 finally 清理 -wal/-shm 边车（主文件已被 replace 消费，exists 判空跳过）
         init_db()
-        # 失效缓存
+        _invalidate_choices_cache()
+        _invalidate_stage_flows_cache()
+        return True
+    except Exception as e:
+        logger.error('自动回滚失败: %s', e)
+        return False
+    finally:
+        _remove_tmp_and_sidecars(tmp_path)
+
+
+def restore_backup(filename: str) -> tuple[bool, str]:
+    """从备份恢复（卡 172 安全顺序）：源预检 → 同目录临时副本复检 → 保护性备份
+    → os.replace 原子替换 → init_db；初始化失败自动回滚到本次保护性备份。
+    返回 (True, 消息) 或 (False, 错误信息)。
+    """
+    # 守卫：路径穿越 / 非法文件名 / 不存在
+    if os.path.basename(filename) != filename:
+        return (False, '非法文件名')
+    if not filename.startswith('orders_backup_') or not filename.endswith('.db'):
+        return (False, '非法文件名')
+    backup_dir = get_backup_dir()
+    src = os.path.join(backup_dir, filename)
+    if not os.path.isfile(src):
+        return (False, '备份文件不存在')
+
+    # 1. 源文件预检：失败立即返回，不备份、不触碰现库
+    ok, err = _validate_sqlite_file(src)
+    if not ok:
+        logger.error('备份文件校验失败，拒绝恢复 %s: %s', src, err)
+        return (False, f'备份文件无效：{err}')
+
+    db_dir = os.path.dirname(os.path.abspath(DB_PATH))
+    tmp_path = ''
+    protective_path = ''
+    try:
+        # 2. 同目录临时副本 + 复检（防复制中断或源文件在复制期间变化）
+        fd, tmp_path = tempfile.mkstemp(dir=db_dir, prefix='.restore_', suffix='.db')
+        os.close(fd)
+        shutil.copy2(src, tmp_path)
+        ok, err = _validate_sqlite_file(tmp_path)
+        if not ok:
+            logger.error('临时副本复检失败 %s: %s', tmp_path, err)
+            return (False, f'备份文件无效：{err}')
+
+        # 3. 保护性备份（现库存在时），失败即停止，绝不覆盖现库
+        if os.path.isfile(DB_PATH):
+            bok, binfo = _do_backup()
+            if not bok:
+                logger.error('恢复前保护性备份失败，已取消恢复: %s', binfo)
+                return (False, f'保护性备份失败，已取消恢复：{binfo}')
+            protective_path = binfo
+
+        # 4. 原子替换，避免直接覆盖过程中留下半个文件
+        os.replace(tmp_path, DB_PATH)
+        # 保留 tmp_path 供 finally 清理 -wal/-shm 边车（主文件已被 replace 消费，exists 判空跳过）
+
+        # 5. 初始化（幂等迁移/补列）；失败自动回滚
+        try:
+            init_db()
+        except Exception as init_exc:
+            logger.error('恢复后初始化失败，尝试自动回滚: %s', init_exc)
+            if _rollback_to_protective(protective_path, db_dir):
+                return (False, '恢复失败，已自动恢复原数据库')
+            return (False, '恢复失败且自动回滚失败，请保留现有文件并人工处理')
+
+        # 6. 仅在最终成功后失效缓存
         _invalidate_choices_cache()
         _invalidate_stage_flows_cache()
         return (True, f'已从备份 {filename} 恢复')
     except Exception as e:
         logger.error('恢复备份失败: %s', e)
         return (False, str(e))
+    finally:
+        _remove_tmp_and_sidecars(tmp_path)
 
 
 def _invalidate_choices_cache():
     """choices 缓存统一失效入口（P19-F10）。
 
-    挂载点：update_settings（写设置唯一入口）、sync_choice_renames（选项重命名改
-    orders 字段值）、init_db（迁移改写数据）、create_order/create_order_with_template/
+    挂载点：update_settings（写设置唯一入口）、reconcile_choice_list / 合并函数
+    （改 choice_items 行）、init_db（迁移改写数据）、create_order/create_order_with_template/
     update_order（订单写入可能带来 auto-discover 新值）。delete_order 不挂（值残留
     无害，下次任一失效点自然清理）。
     """
@@ -749,36 +2181,55 @@ def _invalidate_choices_cache():
 
 
 def get_choices(choice_type):
-    """统一读取选择列表：settings 表 ∪ 注册表 defaults（合并保序去重）+ auto-discover 追加。
+    """统一读取选择列表，**返回值一律是 code**。
 
-    P19-F4 合并语义：不再 `result or fallback` 二选一——
-    - base：settings 有自定义列表则用之（用户可删默认值），否则用注册表 defaults；
-    - auto-discover：orders 表中出现的非默认值且不在 base 中的新值追加到末尾；
-    - 任何情况下返回值都 ⊇ defaults（settings 未自定义时），stage/ddl 等系统列表
-      不会因 orders 表出现非标准值而丢失标准选项。
+    Spec33 卡 160：系统枚举（stage/ddl/payment）base = CODE_TO_LABEL code 集，
+    不再读 *_list settings 键；auto-discover 仍追加库内非注册表值。
+    Spec33 卡 168：用户枚举（source/commission_type）base = choice_items.code，
+    也不再读 *_list；auto-discover 命中未登记值时**补建行**（从"只影响下拉显示"
+    升级为"补登记"），否则界面按 code 反查不到中文、筛选按中文查不到单。
     """
-    reg = CHOICE_REGISTRY.get(choice_type, {})
-    fallback = [x.strip() for x in reg.get('default', '').split(',') if x.strip()]
+    # 系统枚举：base = CODE_TO_LABEL code 集（不读 *_list）
+    if choice_type in ('stage', 'ddl', 'payment'):
+        base = list(CODE_TO_LABEL.get(choice_type, {}).keys())
+        default_set = set(base)
+        # auto-discover：追加库内非注册表值（自定义阶段/脏值）
+        field = CHOICE_REGISTRY.get(choice_type, {}).get('field')
+        if field:
+            try:
+                conn = get_db()
+                rows = conn.execute(
+                    f"SELECT DISTINCT {field} FROM orders WHERE {field} IS NOT NULL AND {field} != ''"
+                ).fetchall()
+                conn.close()
+                for r in rows:
+                    v = r[0] if isinstance(r, tuple) else r[field]
+                    # 只添加不在 base 中且不是已知 code 的值
+                    if v and v not in base and v not in default_set:
+                        base.append(v)
+            except Exception:
+                pass
+        # 合并保序去重
+        seen, merged = set(), []
+        for v in base:
+            if v and v not in seen:
+                seen.add(v)
+                merged.append(v)
+        _CHOICES_CACHE[choice_type] = merged
+        return list(merged)
 
-    # P19-F10：命中进程内缓存直接返回副本（防调用方原地修改污染缓存）
+    # 用户枚举（source/commission_type）：base = choice_items.code（按 sort_order, id）
+    reg = CHOICE_REGISTRY.get(choice_type, {})
+
     cached = _CHOICES_CACHE.get(choice_type)
     if cached is not None:
         return list(cached)
 
-    # 1. settings 表（用户自定义）；无自定义 → 注册表 defaults 作为 base
-    try:
-        settings = get_all_settings()
-        raw = settings.get(f'{choice_type}_list', '')
-        result = [x.strip() for x in raw.split(',') if x.strip()]
-    except Exception:
-        result = []
-    base = result if result else list(fallback)
+    base = [r['code'] for r in get_choice_rows(choice_type)]
 
-    # 2. auto-discover：只添加「用户手动输入的、不在注册表默认列表中」的新值
-    #    即：用户在订单表单里手打了一个新类别 → orders 表有 → 自动加入下拉
-    #    但不会把用户从 settings 中删除的旧值加回来
+    # auto-discover：库内出现但未登记的值 **补建行** 后并入（spec §5.1）。
+    # 老逻辑只把原值塞进列表（界面显示中文、筛选却传中文），是卡 168 修的那个洞。
     field = reg.get('field')
-    default_set = set(fallback)
     if field:
         try:
             conn = get_db()
@@ -788,13 +2239,16 @@ def get_choices(choice_type):
             conn.close()
             for r in rows:
                 v = r[0] if isinstance(r, tuple) else r[field]
-                # 只添加不在默认列表中且不在 base 中的新值
-                if v and v not in base and v not in default_set:
-                    base.append(v)
-        except Exception:
-            pass
+                if not v:
+                    continue
+                code = enum_code(choice_type, v)
+                if code is None:
+                    code = ensure_choice_code(choice_type, v)
+                if code and code not in base:
+                    base.append(code)
+        except Exception as e:
+            logger.error('get_choices(%s) auto-discover 失败：%s', choice_type, e)
 
-    # 3. 合并保序去重（base 可能来自 settings 含重复/空项的极端情况）
     seen, merged = set(), []
     for v in base:
         if v and v not in seen:
@@ -818,48 +2272,52 @@ def get_archive_paid_statuses():
 # stage/ddl 注册表均 editable=False（系统锁定，标准值固定）；get_choices auto-discover
 # 从 orders 表追加的非标准阶段/DDL 值不在本表注册，一律视为非终态，不影响判定。
 STAGE_META = {
-    '待开始': {'terminal': False, 'kind': None,     'progress': 0},
-    '色稿':   {'terminal': False, 'kind': None,     'progress': 20},
-    '线稿':   {'terminal': False, 'kind': None,     'progress': 40},
-    '细化':   {'terminal': False, 'kind': None,     'progress': 60},
-    '收尾':   {'terminal': False, 'kind': None,     'progress': 80},
-    '完成':   {'terminal': True,  'kind': 'done',   'progress': 100},
-    '退单':   {'terminal': True,  'kind': 'refund', 'progress': 100},
+    'pending':   {'terminal': False, 'kind': None,     'progress': 0},
+    'sketch':    {'terminal': False, 'kind': None,     'progress': 20},
+    'lineart':   {'terminal': False, 'kind': None,     'progress': 40},
+    'detail':    {'terminal': False, 'kind': None,     'progress': 60},
+    'finish':    {'terminal': False, 'kind': None,     'progress': 80},
+    'completed': {'terminal': True,  'kind': 'done',   'progress': 100},
+    'cancelled': {'terminal': True,  'kind': 'refund', 'progress': 100},
 }
 
 DDL_STATUS_META = {
-    '正常':    {'kind': 'normal'},
-    '即将到期': {'kind': 'due'},
-    '🔴逾期':  {'kind': 'overdue'},
-    '已完成✅': {'kind': 'done'},
-    '已退单':  {'kind': 'refund'},
+    'normal':  {'kind': 'normal',  'label': '正常',     'emoji': ''},
+    'due':     {'kind': 'due',    'label': '即将到期',  'emoji': ''},
+    'overdue': {'kind': 'overdue','label': '逾期',      'emoji': '\U0001f534'},
+    'done':    {'kind': 'done',   'label': '已完成',    'emoji': '\u2705'},
+    'refund':  {'kind': 'refund', 'label': '已退单',    'emoji': ''},
 }
 
 
 def is_terminal_stage(stage: str) -> bool:
-    """是否终态阶段（完成/退单）；auto-discover 的非标准阶段一律非终态"""
-    return bool(STAGE_META.get(stage, {}).get('terminal'))
+    """是否终态阶段（完成/退单）；auto-discover 的非标准阶段一律非终态。
+    兼容读：内部先过 enum_code_or_raw，对未迁移的中文值同样工作。"""
+    code = enum_code_or_raw('stage', stage)
+    return bool(STAGE_META.get(code, {}).get('terminal'))
 
 
 def is_refund_stage(stage: str) -> bool:
-    """是否退单类终态"""
-    return STAGE_META.get(stage, {}).get('kind') == 'refund'
+    """是否退单类终态。
+    兼容读：内部先过 enum_code_or_raw。"""
+    code = enum_code_or_raw('stage', stage)
+    return STAGE_META.get(code, {}).get('kind') == 'refund'
 
 
 def get_done_stage() -> str:
-    """完成类终态的显示值"""
+    """完成类终态的 code"""
     for name, m in STAGE_META.items():
         if m.get('kind') == 'done':
             return name
-    return '完成'
+    return 'completed'
 
 
 def get_refund_stage() -> str:
-    """退单类终态的显示值"""
+    """退单类终态的 code"""
     for name, m in STAGE_META.items():
         if m.get('kind') == 'refund':
             return name
-    return '退单'
+    return 'cancelled'
 
 
 def get_terminal_stages() -> set:
@@ -871,6 +2329,7 @@ def get_stage_progress(stage: str, order=None) -> int:
     """阶段进度百分比（Spec12：快照优先链）。
     查找顺序：本单快照 stage_flow → STAGE_META → 退单=100 / 未知=0。
     order 可为 dict/Row/dataclass；传 None 时退化为仅查 STAGE_META。
+    兼容读：STAGE_META 查找前先过 enum_code_or_raw。
     """
     # 1. 快照命中
     if order is not None:
@@ -881,29 +2340,30 @@ def get_stage_progress(stage: str, order=None) -> int:
                 if p is not None:
                     return p
     # 2. STAGE_META 兜底（含退单=100、未知=0）
-    return int(STAGE_META.get(stage, {}).get('progress', 0))
+    code = enum_code_or_raw('stage', stage)
+    return int(STAGE_META.get(code, {}).get('progress', 0))
 
 
 def get_ddl_status(kind: str) -> str:
-    """按语义 kind 取 DDL 状态显示值（normal/due/overdue/done/refund）"""
-    for label, m in DDL_STATUS_META.items():
+    """按语义 kind 取 DDL 状态 code（normal/due/overdue/done/refund）"""
+    for code, m in DDL_STATUS_META.items():
         if m.get('kind') == kind:
-            return label
-    return '正常'
+            return code
+    return 'normal'
 
 
 # ═══════════════════════════════════════════════════════════
 # Spec12 阶段流程预设（stage_flows）
-# 锁定三锚点：待开始(0)/完成(100) 为每条流程的首尾；退单 独立终态，不进流程
+# 锁定三锚点：pending(0)/completed(100) 为每条流程的首尾；cancelled 独立终态，不进流程
 # 订单 orders.stage_flow 存本单快照 JSON，改设置预设不影响历史订单
 # ═══════════════════════════════════════════════════════════
 
 _STAGE_FLOWS_CACHE = None  # 进程内缓存（None 表示未加载）
 
 # 锁定锚点（不可改名/改百分比，前端/后端强校验）
-ANCHOR_FIRST_NAME = '待开始'
+ANCHOR_FIRST_NAME = 'pending'
 ANCHOR_FIRST_PROGRESS = 0
-ANCHOR_LAST_NAME = '完成'
+ANCHOR_LAST_NAME = 'completed'
 ANCHOR_LAST_PROGRESS = 100
 
 
@@ -917,12 +2377,12 @@ def _default_stage_flows() -> list:
     """默认流程（与 _ensure_default_settings 写入的兜底值保持一致）"""
     return [
         {'name': '默认流程', 'stages': [
-            {'name': '待开始', 'progress': ANCHOR_FIRST_PROGRESS},
-            {'name': '色稿',   'progress': 20},
-            {'name': '线稿',   'progress': 40},
-            {'name': '细化',   'progress': 60},
-            {'name': '收尾',   'progress': 80},
-            {'name': '完成',   'progress': ANCHOR_LAST_PROGRESS},
+            {'name': 'pending',   'progress': ANCHOR_FIRST_PROGRESS},
+            {'name': 'sketch',    'progress': 20},
+            {'name': 'lineart',   'progress': 40},
+            {'name': 'detail',    'progress': 60},
+            {'name': 'finish',    'progress': 80},
+            {'name': 'completed', 'progress': ANCHOR_LAST_PROGRESS},
         ]},
     ]
 
@@ -947,16 +2407,38 @@ def get_stage_flows() -> list:
     return [dict(f, stages=[dict(s) for s in f['stages']]) for f in flows]
 
 
+def _normalize_stage_name(raw) -> str:
+    """中间阶段名归一：strip → 能识别成 stage code（含「色稿」等全部中文旧标签）就转 code
+    → 否则原样返回（自定义名）。复用 enum_code_or_raw，绝不靠字符集猜。
+    供 save_stage_flows 校验前统一存储值：先归一再查重，令 sketch 与「色稿」落库同值，
+    二者并存会被重复校验拦下。"""
+    if not isinstance(raw, str):
+        return raw
+    return enum_code_or_raw('stage', raw.strip())
+
+
 def save_stage_flows(flows: list) -> None:
-    """保存流程预设（先逐条 validate，任一失败抛 ValueError）。
+    """保存流程预设（先把中间阶段名归一为 code，再逐条 validate，任一失败抛 ValueError）。
+    归一在查重之前，令「色稿」与 sketch 落库同值 → 二者并存触发重复错误。
     成功后写 settings 并统一失效缓存（_invalidate_choices_cache 也会连带触发，
     保证 stage 选择列表 auto-discover 与新流程同步）。
     """
+    normalized = []
     for f in flows:
+        stages = f.get('stages', [])
+        last_idx = len(stages) - 1
+        new_stages = []
+        for idx, s in enumerate(stages):
+            # 仅归一中间阶段名；首尾锚点必须已是 pending/completed 原值
+            if isinstance(s, dict) and 0 < idx < last_idx:
+                s = dict(s, name=_normalize_stage_name(s.get('name')))
+            new_stages.append(s)
+        normalized.append(dict(f, stages=new_stages))
+    for f in normalized:
         ok, msg = validate_stage_flow(f.get('stages', []))
         if not ok:
             raise ValueError(f"流程「{f.get('name','')}」校验失败：{msg}")
-    update_settings({'stage_flows': json.dumps(flows, ensure_ascii=False)})
+    update_settings({'stage_flows': json.dumps(normalized, ensure_ascii=False)})
     _invalidate_stage_flows_cache()
 
 
@@ -964,9 +2446,15 @@ def validate_stage_flow(stages) -> tuple:
     """校验单条流程的阶段列表。返回 (ok: bool, msg: str)。
     规则：
     - stages 必须是 list，且至少 2 项（首尾锚点）
-    - 首项 = {待开始, 0}；末项 = {完成, 100}
+    - 首项 = {pending, 0}；末项 = {completed, 100}
     - 中间项：0 < progress < 100，严格递增
-    - 名称：非空、不与 待开始/完成/退单 重名（除锚点本身）、流程内不重复
+    - 名称：非空、流程内不重复
+    - 中间阶段名（Spec33 D18 范围澄清，卡171）：
+      · 允许引用内置阶段 code（sketch/lineart/detail/finish 等非终态 stage code）——
+        出厂默认流程本就是这些 code，D18 从未禁止流程引用内置阶段；
+      · 终态 stage code（completed/cancelled）不得出现在中间（退单在中间会误触发
+        自动归档/退款判断）；
+      · 仍拒绝其他类别保留字 / 旧标签（防真自定义阶段名撞 code，D18 对自定义名继续生效）。
     """
     if not isinstance(stages, list) or len(stages) < 2:
         return (False, "至少需要 2 个阶段（首尾锚点）")
@@ -975,15 +2463,16 @@ def validate_stage_flow(stages) -> tuple:
         return (False, "阶段结构非法（需要 {name, progress}）")
     # 锚点校验
     if first.get('name') != ANCHOR_FIRST_NAME:
-        return (False, f"首阶段必须为「{ANCHOR_FIRST_NAME}」")
+        return (False, f"首阶段必须为「{enum_label('stage', ANCHOR_FIRST_NAME)}」")
     if _to_int(first.get('progress')) != ANCHOR_FIRST_PROGRESS:
         return (False, f"首阶段进度必须为 {ANCHOR_FIRST_PROGRESS}%")
     if last.get('name') != ANCHOR_LAST_NAME:
-        return (False, f"末阶段必须为「{ANCHOR_LAST_NAME}」")
+        return (False, f"末阶段必须为「{enum_label('stage', ANCHOR_LAST_NAME)}」")
     if _to_int(last.get('progress')) != ANCHOR_LAST_PROGRESS:
         return (False, f"末阶段进度必须为 {ANCHOR_LAST_PROGRESS}%")
-    # 遍历校验
-    reserved = {ANCHOR_FIRST_NAME, ANCHOR_LAST_NAME, get_refund_stage()}
+    # 遍历校验（Spec33 D18 范围澄清，卡171：中间阶段放行内置 stage code）
+    reserved = RESERVED_ENUM_CODES
+    stage_codes = CODE_TO_LABEL.get('stage', {})
     seen = {ANCHOR_FIRST_NAME, ANCHOR_LAST_NAME}
     prev = ANCHOR_FIRST_PROGRESS
     for i, s in enumerate(stages):
@@ -995,10 +2484,12 @@ def validate_stage_flow(stages) -> tuple:
         progress = _to_int(s.get('progress'))
         if progress is None:
             return (False, f"第 {i+1} 项进度非法")
-        # 首末锚点已在 reserved 中，跳过重复校验
+        # 首末锚点单独校验，中间项走下面这套
         if i != 0 and i != len(stages) - 1:
-            if name in reserved:
-                return (False, f"阶段名「{name}」为保留锚点")
+            if is_terminal_stage(name):
+                return (False, f"阶段名「{enum_label('stage', name)}」为终态阶段，不能作为中间阶段")
+            if name not in stage_codes and name in reserved:
+                return (False, f"阶段名「{enum_label('stage', name)}」为系统保留字，不可用作自定义阶段名")
             if name in seen:
                 return (False, f"阶段名「{name}」重复")
             if not (prev < progress < ANCHOR_LAST_PROGRESS):
@@ -1101,41 +2592,45 @@ def _ensure_default_settings(conn):
         # 外观设置
         'font_size': '16px',
         'font_family': 'system',
-        # 来源属性：哪些是平台来源（有手续费）
-        'source_list': '米画师,B站工坊,画加,微信,QQ,其他',
-        'platform_sources': '米画师,B站工坊,画加',
-        'payment_status_list': '已收定金,未收款,已结算,欠款,免收',
-        'commission_type_list': '单人半身,色稿大头,双人横插,立绘,场景插画,Q版,服设,厚涂头像',
+        # ⚠️ 卡 168：`source_list` / `platform_sources` / `payment_status_list` /
+        # `commission_type_list` 四个中文键**禁止**再写入默认值。迁移引擎 M12/M13/M14
+        # 已把它们删掉（值进了 choice_items.code / is_platform 列），这里每次启动
+        # INSERT OR IGNORE 等于把键复活，随即被 apply_legacy_source_settings 当成
+        # 用户最新配置回写列 —— 实测米画师平台标记被 0→1 漂移、新建单凭空预填 5% 费率。
         # Calendar color palettes (per mode) — validated against dataviz reference
-        'cal_source_米画师': '#2a78d6',
-        'cal_source_B站工坊': '#1baf7a',
-        'cal_source_微信': '#eda100',
-        'cal_source_其他': '#008300',
-        'cal_stage_待开始': '#898781',
-        'cal_stage_色稿': '#2a78d6',
-        'cal_stage_线稿': '#1baf7a',
-        'cal_stage_细化': '#eda100',
-        'cal_stage_收尾': '#4a3aa7',
-        'cal_stage_完成': '#008300',
-        'cal_stage_退单': '#e34948',
-        'cal_ddl_正常': '#0ca30c',
-        'cal_ddl_即将到期': '#fab219',
-        'cal_ddl_🔴逾期': '#d03b3b',
-        'cal_ddl_已完成✅': '#898781',
-        'cal_payment_已收定金': '#2a78d6',
-        'cal_payment_未收款': '#fab219',
-        'cal_payment_已结算': '#0ca30c',
-        'cal_payment_欠款': '#d03b3b',
-        'cal_payment_免收': '#008300',
+        # 卡 169 D-3：键后缀一律 code（与 M8-M10 的换键结果、CALENDAR_PALETTES、
+        # 设置页着色面板、`_build_theme_css` 读链四处对齐）。此前留中文后缀，导致
+        # 每次启动 INSERT OR IGNORE 把 M8 已删的中文键复活成默认色，而取色中文优先
+        # → 用户自定的 7 个阶段色被默认值盖掉。
+        'cal_source_mihuashi': '#2a78d6',
+        'cal_source_bili': '#1baf7a',
+        'cal_source_wechat': '#eda100',
+        'cal_source_other': '#008300',
+        'cal_stage_pending': '#898781',
+        'cal_stage_sketch': '#2a78d6',
+        'cal_stage_lineart': '#1baf7a',
+        'cal_stage_detail': '#eda100',
+        'cal_stage_finish': '#4a3aa7',
+        'cal_stage_completed': '#008300',
+        'cal_stage_cancelled': '#e34948',
+        'cal_ddl_normal': '#0ca30c',
+        'cal_ddl_due': '#fab219',
+        'cal_ddl_overdue': '#d03b3b',
+        'cal_ddl_done': '#898781',
+        'cal_payment_deposit_paid': '#2a78d6',
+        'cal_payment_unpaid': '#fab219',
+        'cal_payment_settled': '#0ca30c',
+        'cal_payment_debt': '#d03b3b',
+        'cal_payment_waived': '#008300',
         # Spec12 阶段流程预设：JSON 数组，每项为一条流程（中间阶段由 STAGE_META 非终态派生）
         'stage_flows': json.dumps([
             {'name': '默认流程', 'stages': [
-                {'name': '待开始', 'progress': 0},
-                {'name': '色稿',   'progress': 20},
-                {'name': '线稿',   'progress': 40},
-                {'name': '细化',   'progress': 60},
-                {'name': '收尾',   'progress': 80},
-                {'name': '完成',   'progress': 100},
+                {'name': 'pending',   'progress': 0},
+                {'name': 'sketch',    'progress': 20},
+                {'name': 'lineart',   'progress': 40},
+                {'name': 'detail',    'progress': 60},
+                {'name': 'finish',    'progress': 80},
+                {'name': 'completed', 'progress': 100},
             ]},
         ], ensure_ascii=False),
         # Spec19 VIP 折扣预设：JSON 数组（客户表单折扣输入 datalist 候选值，单位 %）
@@ -1148,6 +2643,67 @@ def _ensure_default_settings(conn):
         conn.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v)
         )
+    # 卡 168 T168.4：清残留（幂等）。M12/M13/M14 已经删过这四个键，此后任何残留
+    # 都是历史版本的 `_ensure_default_settings` 复活出来的伪配置 —— 必须抹掉，
+    # 否则 `apply_legacy_source_settings`（靠「键存在才应用」判定）会拿它回写
+    # is_platform / default_fee_pct 列，实测把米画师的平台标记从 0 漂到 1。
+    # ⚠️ 只在**迁移完成后**才敢删：未迁移库的这四个键是用户原序/平台勾选的唯一
+    # 来源，迁移引擎后面还要读（M11/M12 搬列、M13/M14 删键由引擎自己负责）。
+    if _enum_codes_migrated(conn):
+        leftover = conn.execute(
+            "SELECT COUNT(*) FROM settings WHERE key IN "
+            "('source_list','platform_sources','payment_status_list','commission_type_list')"
+        ).fetchone()[0]
+        if leftover:
+            conn.execute(
+                "DELETE FROM settings WHERE key IN "
+                "('source_list','platform_sources','payment_status_list','commission_type_list')")
+            logger.info('卡168 T168.4: 清理 4 个遗留配置键 %d 行', leftover)
+
+
+def _cleanup_legacy_palette_keys(conn) -> None:
+    """卡 169 D-3：收口历史遗留的中文后缀 `cal_*` 配色键（幂等）。
+
+    判据统一为「后缀能被解析成**另一个** code」（即后缀是标签或旧写法）。解析器按 kind
+    分流，与 `models._normalize_enum_token` 同规：系统三类走 `enum_code`（认不出返回
+    None），用户两类走 `resolve_choice_code`（读 choice_items，只读不建行）。解析不出
+    code 的自定义阶段名（`cal_stage_草稿`）天然不受影响。
+    命中后按 code 键是否已存在分两种处理：
+      · `cal_<kind>_<code>` 已存在 ⇒ 中文键是旧版 `_ensure_default_settings` 复活出来
+        的默认色残渣（留着会盖住用户配色，并被 save_color_preset 的整包快照带走）→ 删。
+      · `cal_<kind>_<code>` 不存在 ⇒ 用户色只活在这一把中文键上 → **搬值过去再删**。
+        M8-M10 对 source/commission_type 用的是 `seed_choice_items` 返回的**在用例**映射
+        （`first_run=False` 时只含被订单用到的值），未被任何订单使用的内置标签不在其中、
+        换键被跳过；此处若直接删就等于丢色（卡 169 真实库实测丢 6 个稿件类别色）。
+
+    ⚠️ 调用点必须在 `init_db()` **末尾**：门控用的 `user_version=33` 由迁移引擎在本函数
+    之外的后段才写入，放在中段会因门控为 False 整块跳过（卡 169 实测首启漏跑）。
+    """
+    _cal_kinds = {'cal_stage_': 'stage', 'cal_ddl_': 'ddl', 'cal_payment_': 'payment',
+                  'cal_source_': 'source', 'cal_commission_': 'commission_type'}
+    _sys_kinds = ('stage', 'ddl', 'payment')
+    handled, moved = [], []
+    for _key, _value in conn.execute(
+            "SELECT key, value FROM settings WHERE key GLOB 'cal_*'").fetchall():
+        for _prefix, _kind in _cal_kinds.items():
+            if not _key.startswith(_prefix):
+                continue
+            _suffix = _key[len(_prefix):]
+            _code = (enum_code(_kind, _suffix) if _kind in _sys_kinds
+                     else resolve_choice_code(_kind, _suffix))
+            if _code and _code != _suffix:
+                _code_key = _prefix + _code
+                if not conn.execute('SELECT 1 FROM settings WHERE key = ?',
+                                    (_code_key,)).fetchone():
+                    conn.execute('INSERT INTO settings (key, value) VALUES (?, ?)',
+                                 (_code_key, _value))
+                    moved.append(_code_key)
+                conn.execute('DELETE FROM settings WHERE key = ?', (_key,))
+                handled.append(_key)
+            break
+    if handled:
+        logger.info('卡169 D-3: 收口中文后缀配色键 %d 个（其中搬值保色 %d 个: %s）: %s',
+                    len(handled), len(moved), moved, handled)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -1228,99 +2784,61 @@ def _save_stats_lab_presets(presets: list) -> None:
     update_settings({_STATS_LAB_PRESETS_KEY: json.dumps(presets, ensure_ascii=False)})
 
 
-def sync_choice_renames(conn, data: dict, settings_key: str, order_field: str) -> dict:
-    """设置页改选择列表时，把 orders 表中「去 emoji 后同名」的旧值重命名为新值（P19-F5 纳入事务）。
-
-    仅处理模糊匹配（去非文字字符后相等）的重命名；完全不匹配的旧值保留
-    （由 get_choices auto-discover 继续展示）。在传入事务连接上执行，不 commit。
-    P19-F9 唯一性护栏：去 emoji 后的目标名在新清单中**唯一**才合并；
-    多候选（两个不同来源去 emoji 后同名）跳过并记日志，防订单来源字段被批量误并。
-    返回 {旧值: (新值, [受影响订单 id])}，供调用方做级联（如来源费率快照刷新）。
-    """
-    renamed: dict = {}
-    if settings_key not in data:
-        return renamed
-    import re
-    new_values = {x.strip() for x in data[settings_key].split(',') if x.strip()}
-    rows = conn.execute(
-        f"SELECT DISTINCT {order_field} FROM orders WHERE {order_field} IS NOT NULL AND {order_field} != ''"
-    ).fetchall()
-    for row in rows:
-        old_val = row[0]
-        if not old_val or old_val in new_values:
-            continue
-        old_clean = re.sub(r'[^\w一-鿿]', '', old_val)
-        matches = [nv for nv in new_values
-                   if re.sub(r'[^\w一-鿿]', '', nv) == old_clean and nv != old_val]
-        if len(matches) > 1:
-            logger.warning('P19-F9 重命名护栏：%r 去 emoji 后匹配多个候选 %r，跳过合并', old_val, matches)
-            continue
-        if len(matches) == 1:
-            nv = matches[0]
-            ids = [r[0] for r in conn.execute(
-                f"SELECT id FROM orders WHERE {order_field} = ?", (old_val,)
-            ).fetchall()]
-            conn.execute(
-                f"UPDATE orders SET {order_field} = ?, updated_at = datetime('now','localtime') WHERE {order_field} = ?",
-                (nv, old_val)
-            )
-            renamed[old_val] = (nv, ids)
-    if renamed:
-        # P19-F10：重命名改写 orders 字段值（auto-discover 来源），失效缓存
-        _invalidate_choices_cache()
-    return renamed
-
-
 def merge_commission_types(old_names: list, new_name: str) -> dict:
-    """类别合并：将多个旧类别名统一更新为新名称，并同步更新 commission_type_list 和颜色配置。
+    """类别合并：把多个旧类别统一改判到目标类别（**全程 code 空间**）。
 
-    返回 {'merged': {old: count}, 'total': int}。
+    卡 168 重写：入参 old_names 允许 code 或中文 label（前端在新建项未落库时只能给
+    label），逐个归一为 code；new_name 是目标显示名 —— 已有同名项则并进它的 code，
+    没有则当场登记新行。orders 列写 code，改名只动 choice_items.label。
+    返回 {'merged': {入参: 单数}, 'total': int}。
     """
-    if not old_names or not new_name.strip():
+    if not old_names or not (new_name or '').strip():
         return {'merged': {}, 'total': 0}
     new_name = new_name.strip()
     merged = {}
     with transaction() as conn:
+        ensure_choice_items_table(conn)
+        target_code = (_ensure_choice_code_conn(conn, 'commission_type', new_name)
+                       or new_name)
+        old_codes = []
         for old in old_names:
-            old = old.strip()
-            if not old or old == new_name:
-                continue
+            code = resolve_choice_code('commission_type', old.strip() if isinstance(old, str) else old)
+            if code and code != target_code and code not in old_codes:
+                old_codes.append(code)
+        for old in old_codes:
             cnt = conn.execute(
-                "UPDATE orders SET commission_type = ?, updated_at = datetime('now','localtime') WHERE commission_type = ?",
-                (new_name, old)
-            ).rowcount
+                "UPDATE orders SET commission_type=?, updated_at=datetime('now','localtime') "
+                "WHERE commission_type=?", (target_code, old)).rowcount
             if cnt > 0:
                 merged[old] = cnt
-        # 更新 commission_type_list：移除旧名，确保新名存在
-        ct_list_raw = conn.execute(
-            "SELECT value FROM settings WHERE key = 'commission_type_list'"
-        ).fetchone()
-        if ct_list_raw:
-            items = [x.strip() for x in ct_list_raw['value'].split(',') if x.strip()]
-            items = [x for x in items if x not in old_names]
-            if new_name not in items:
-                items.append(new_name)
-            conn.execute(
-                "INSERT OR REPLACE INTO settings (key, value) VALUES ('commission_type_list', ?)",
-                (','.join(items),)
-            )
-        # 迁移颜色配置：如果旧类别有自定义颜色且新类别无配置，则继承第一个旧类别的颜色
-        for old in merged:
-            old_color_key = f'cal_commission_{old}'
-            new_color_key = f'cal_commission_{new_name}'
-            old_color = conn.execute(
-                "SELECT value FROM settings WHERE key = ?", (old_color_key,)
-            ).fetchone()
-            if old_color:
-                existing_new = conn.execute(
-                    "SELECT value FROM settings WHERE key = ?", (new_color_key,)
-                ).fetchone()
-                if not existing_new:
-                    conn.execute(
-                        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-                        (new_color_key, old_color['value'])
-                    )
-                conn.execute("DELETE FROM settings WHERE key = ?", (old_color_key,))
+        # 目标项改名（唯一事实源）+ 旧行删除（含颜色键，仅当无订单残留）
+        row = conn.execute('SELECT label FROM choice_items WHERE kind=? AND code=?',
+                           ('commission_type', target_code)).fetchone()
+        if row and row[0] != new_name:
+            conn.execute("UPDATE choice_items SET label=?, updated_at=datetime('now','localtime') "
+                         'WHERE kind=? AND code=?', (new_name, 'commission_type', target_code))
+        # Spec 28 迁移语义：目标无色而旧项有 → 继承第一个旧色（必须早于下面的删键）
+        new_color_key = f'cal_commission_{target_code}'
+        have_new = conn.execute('SELECT 1 FROM settings WHERE key=?',
+                                (new_color_key,)).fetchone()
+        if not have_new:
+            for old in old_codes:
+                old_color = conn.execute('SELECT value FROM settings WHERE key=?',
+                                         (f'cal_commission_{old}',)).fetchone()
+                if old_color:
+                    conn.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?,?)',
+                                 (new_color_key, old_color[0]))
+                    break
+        # 旧行删除（含颜色键），仅当无订单残留
+        for old in old_codes:
+            left = conn.execute('SELECT COUNT(*) FROM orders WHERE commission_type=?',
+                                (old,)).fetchone()[0]
+            if left:
+                logger.warning('类别合并：%s 仍有 %d 单残留，保留行', old, left)
+                continue
+            conn.execute('DELETE FROM choice_items WHERE kind=? AND code=?',
+                         ('commission_type', old))
+            conn.execute('DELETE FROM settings WHERE key=?', (f'cal_commission_{old}',))
     _invalidate_choices_cache()
     total = sum(merged.values())
     logger.info('类别合并：%s → 「%s」，共更新 %d 单', list(merged.keys()), new_name, total)
@@ -1328,12 +2846,26 @@ def merge_commission_types(old_names: list, new_name: str) -> dict:
 
 
 def get_default_fee_for_source(source: str) -> float:
-    """P19-F9：来源默认费率 %（设置键 default_fee_<source>，缺省 5.0，与订单表单默认值一致）；
-    非平台来源/空来源 → 0.0（无手续费语义）。读已提交设置（自开连接），供写入管线使用。"""
-    if not source or source not in get_platform_sources():
+    """P19-F9：来源默认费率 %（choice_items.default_fee_pct 列，缺省 5.0，与订单表单默认值一致）；
+    非平台来源/空来源 → 0.0（无手续费语义）。读已提交设置（自开连接），供写入管线使用。
+
+    卡 169 D-2：入参兼容 code 与中文标签两种写法。写入管线给的是 code，而平台集合
+    按 code 存 —— 直接拿 code 去比标签集会判成「非平台」，平台单费率恒为 0
+    （实测 `bili` → 0.0 / `B站工坊` → 5.0，同样的钱一个扣费一个不扣）。
+    """
+    if not source:
         return 0.0
+    code = resolve_choice_code('source', source) or source
+    if code not in get_platform_source_codes():
+        return 0.0
+    for r in get_choice_rows('source'):            # Spec 33 卡 159：费率已列化
+        if r['code'] == code:
+            try:
+                return float(r['default_fee_pct'])
+            except (TypeError, ValueError):
+                return 5.0
     try:
-        return float(get_all_settings().get(f'default_fee_{source}', '5') or 5)
+        return float(get_all_settings().get(f"default_fee_{choice_label('source', code)}", '5') or 5)
     except (TypeError, ValueError):
         return 5.0
 
@@ -1347,7 +2879,15 @@ def get_default_fees_map() -> dict:
     except Exception as e:
         logging.error(f'get_default_fees_map 读取设置失败: {e}')
         settings = {}
+    rows = {r['label']: r for r in get_choice_rows('source')}
     for src in get_platform_sources():
+        r = rows.get(src)
+        if r is not None:                          # Spec 33 卡 159：读列
+            try:
+                fees[src] = float(r['default_fee_pct'])
+            except (TypeError, ValueError):
+                fees[src] = 5.0
+            continue
         try:
             fees[src] = float(settings.get(f'default_fee_{src}', '5') or 5)
         except (TypeError, ValueError):
@@ -1356,20 +2896,23 @@ def get_default_fees_map() -> dict:
 
 
 def resnapshot_fee_for_renamed_source(conn, order_ids: list, new_source: str) -> int:
-    """P19-F9 来源重命名级联：受影响订单 pct 快照刷新为新来源默认费率，
+    """P19-F9 来源重命名/合并级联：受影响订单 pct 快照刷新为新来源默认费率，
     并按快照重算 platform_fee / actual_received（income 不变），涉及客户统计同步重算。
     在传入事务连接上执行（与重命名/设置更新同事务，卡55 单管线）。
     只处理本次重命名实际波及的订单 id——原本就是新名称的订单不动（历史快照不改写）。
+
+    卡 168：平台标记与费率改读 choice_items 列（platform_sources / default_fee_ 两族
+    键已随 T168.4 删除）。`new_source` 传 code；兼容传 label（先归一）。
     """
     if not order_ids:
         return 0
-    row = conn.execute("SELECT value FROM settings WHERE key = 'platform_sources'").fetchone()
-    platforms = {x.strip() for x in (row[0] if row else '米画师,B站工坊,画加').split(',') if x.strip()}
+    code = resolve_choice_code('source', new_source) or new_source
+    row = conn.execute("SELECT is_platform, default_fee_pct FROM choice_items "
+                       "WHERE kind='source' AND code=?", (code,)).fetchone()
     pct = 0.0
-    if new_source in platforms:
-        fee_row = conn.execute("SELECT value FROM settings WHERE key = ?", (f'default_fee_{new_source}',)).fetchone()
+    if row and row['is_platform']:
         try:
-            pct = float((fee_row[0] if fee_row else '5') or 5)
+            pct = float(row['default_fee_pct'] if row['default_fee_pct'] is not None else 5.0)
         except (TypeError, ValueError):
             pct = 5.0
     marks = ','.join('?' * len(order_ids))
@@ -1395,177 +2938,96 @@ def resnapshot_fee_for_renamed_source(conn, order_ids: list, new_source: str) ->
     return len(rows)
 
 
-# ── Spec 28 phase-14：来源删除/合并后端（task-132；设置页 UI 归 task-133）──
-
-def count_source_usage(source_name: str) -> int:
-    """来源使用计数：orders 表引用该来源的订单数（D9 删除确认对话框
-    「N 个订单受影响」数据源）。"""
-    if not source_name:
-        return 0
-    conn = get_db()
-    n = conn.execute(
-        "SELECT COUNT(*) FROM orders WHERE source = ?", (source_name,)
-    ).fetchone()[0]
-    conn.close()
-    return n
-
-
-def _purge_source_settings_keys(conn, source_name: str) -> None:
-    """清理来源专属设置键（default_fee_<s> 费率 + cal_source_<s> 日历颜色）。
-    来源删除（无引用或确认置空）后调用，防孤儿配置残留。"""
-    for key in (f'default_fee_{source_name}', f'cal_source_{source_name}'):
-        conn.execute("DELETE FROM settings WHERE key = ?", (key,))
-
+# ── Spec 28 phase-14：来源合并后端（task-132；设置页 UI 归 task-133）──
 
 def merge_sources(old_names: list, new_name: str) -> dict:
     """来源合并（D10：参考 merge_commission_types 同结构，不通用化）。
 
-    单事务内：批量迁移 orders.source → 更新 source_list（移旧保新）→
-    平台标记迁移（platform_sources：新名未标记而旧名有标记 → 继承，旧名移除）→
-    费率配置迁移（default_fee_ 前缀：同理，继承第一个旧来源）→ 日历颜色迁移
-    （cal_source_ 前缀：新名无色继承旧色，旧键删除）→ 费率快照级联
-    （resnapshot_fee_for_renamed_source：受影响订单按新来源默认费率重算
-    pct/fee/actual_received，客户统计同步刷新）。old == new_name 的项跳过。
-    返回 {'merged': {old: count}, 'total': int}。
+    卡 168 起**全程 code 空间**：old/new 先解析成 code（新名未登记则当场建行），
+    orders.source 写目标 code。平台标记与默认费率从「settings 的 platform_sources /
+    default_fee_* 键」改为读写 choice_items 的 is_platform / default_fee_pct 列
+    （目标未标平台而任一旧名标了 → 继承；目标费率为默认 5.0 而旧名有非默认值 →
+    继承第一个）；日历颜色键 cal_source_<code> 同理（目标无色继承第一个旧色）。
+    随后删除旧行与旧色键，并对受影响订单重算费率快照
+    （resnapshot_fee_for_renamed_source：按目标来源的默认费率重算 pct/fee/
+    actual_received，客户统计同步刷新）。old == new_name 的项跳过。
+    返回 {'merged': {旧显示名: count}, 'total': int}。
     """
-    if not old_names or not new_name.strip():
+    if not old_names or not (new_name or '').strip():
         return {'merged': {}, 'total': 0}
     new_name = new_name.strip()
-    olds = [o.strip() for o in old_names if o and o.strip() and o.strip() != new_name]
     merged = {}
     with transaction() as conn:
+        ensure_choice_items_table(conn)
+        target_code = _ensure_choice_code_conn(conn, 'source', new_name) or new_name
+        by_code = {r['code']: dict(r) for r in conn.execute(
+            "SELECT code, label, is_platform, default_fee_pct FROM choice_items "
+            "WHERE kind='source'").fetchall()}
+        resolved = []
+        for old in old_names:
+            token = old.strip() if isinstance(old, str) else old
+            code = resolve_choice_code('source', token) if token else None
+            if code and code != target_code and code not in resolved:
+                resolved.append(code)
         affected_ids: list = []
-        for old in olds:
+        for old_code in resolved:
             ids = [r[0] for r in conn.execute(
-                "SELECT id FROM orders WHERE source = ?", (old,)
-            ).fetchall()]
+                "SELECT id FROM orders WHERE source = ?", (old_code,)).fetchall()]
             cnt = conn.execute(
                 "UPDATE orders SET source = ?, updated_at = datetime('now','localtime') WHERE source = ?",
-                (new_name, old)
+                (target_code, old_code)
             ).rowcount
             if cnt > 0:
-                merged[old] = cnt
+                label = (by_code.get(old_code) or {}).get('label', old_code)
+                merged[label] = merged.get(label, 0) + cnt
                 affected_ids.extend(ids)
-        # source_list：移除旧名，确保新名存在
-        src_row = conn.execute(
-            "SELECT value FROM settings WHERE key = 'source_list'"
-        ).fetchone()
-        if src_row:
-            items = [x.strip() for x in src_row['value'].split(',') if x.strip()]
-            items = [x for x in items if x not in olds]
-            if new_name not in items:
-                items.append(new_name)
-            conn.execute(
-                "INSERT OR REPLACE INTO settings (key, value) VALUES ('source_list', ?)",
-                (','.join(items),)
-            )
-        # 平台标记：新名未标记而旧名有标记 → 新名继承；旧名从列表移除
-        plat_row = conn.execute(
-            "SELECT value FROM settings WHERE key = 'platform_sources'"
-        ).fetchone()
-        if plat_row:
-            plats = [x.strip() for x in plat_row['value'].split(',') if x.strip()]
-            if new_name not in plats and any(o in plats for o in olds):
-                plats.append(new_name)
-            plats = [p for p in plats if p not in olds]
-            conn.execute(
-                "INSERT OR REPLACE INTO settings (key, value) VALUES ('platform_sources', ?)",
-                (','.join(plats),)
-            )
-        # 费率配置：新名无 default_fee_ 且旧名有 → 继承第一个；旧键清理
-        fee_new = conn.execute(
-            "SELECT value FROM settings WHERE key = ?", (f'default_fee_{new_name}',)
-        ).fetchone()
-        if not fee_new:
-            for old in olds:
-                old_fee = conn.execute(
-                    "SELECT value FROM settings WHERE key = ?", (f'default_fee_{old}',)
-                ).fetchone()
-                if old_fee:
-                    conn.execute(
-                        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-                        (f'default_fee_{new_name}', old_fee['value'])
-                    )
+        # 目标行：label 归一 + 平台/费率继承（目标缺省时）
+        target_row = by_code.get(target_code)
+        old_rows = [by_code[c] for c in resolved if c in by_code]
+        if target_row is not None:
+            sets, params = [], []
+            if target_row['label'] != new_name:
+                sets.append('label=?')
+                params.append(new_name)
+            if not target_row['is_platform'] and any(r['is_platform'] for r in old_rows):
+                sets.append('is_platform=1')
+            if float(target_row['default_fee_pct'] or 5.0) == 5.0:
+                for r in old_rows:
+                    fee = float(r['default_fee_pct'] or 5.0)
+                    if fee != 5.0:
+                        sets.append('default_fee_pct=?')
+                        params.append(fee)
+                        break
+            if sets:
+                sets.append("updated_at=datetime('now','localtime')")
+                conn.execute(f"UPDATE choice_items SET {', '.join(sets)} "
+                             'WHERE kind=? AND code=?', (*params, 'source', target_code))
+        # 日历颜色：目标无色继承第一个旧色（必须早于删键）
+        color_key = f'cal_source_{target_code}'
+        if not conn.execute('SELECT 1 FROM settings WHERE key=?', (color_key,)).fetchone():
+            for old_code in resolved:
+                old_color = conn.execute('SELECT value FROM settings WHERE key=?',
+                                         (f'cal_source_{old_code}',)).fetchone()
+                if old_color:
+                    conn.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)',
+                                 (color_key, old_color[0]))
                     break
-        # 日历颜色：新名无色继承第一个旧色；旧键删除（含无订单旧来源，防残留）
-        color_new = conn.execute(
-            "SELECT value FROM settings WHERE key = ?", (f'cal_source_{new_name}',)
-        ).fetchone()
-        for old in olds:
-            old_color = conn.execute(
-                "SELECT value FROM settings WHERE key = ?", (f'cal_source_{old}',)
-            ).fetchone()
-            if old_color:
-                if not color_new:
-                    conn.execute(
-                        "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-                        (f'cal_source_{new_name}', old_color['value'])
-                    )
-                    color_new = old_color
-                conn.execute("DELETE FROM settings WHERE key = ?", (f'cal_source_{old}',))
-        for old in olds:
-            conn.execute("DELETE FROM settings WHERE key = ?", (f'default_fee_{old}',))
+        # 旧行 + 旧色键删除（仅当无订单残留）
+        for old_code in resolved:
+            left = conn.execute('SELECT COUNT(*) FROM orders WHERE source = ?',
+                                (old_code,)).fetchone()[0]
+            if left:
+                logger.warning('来源合并：%s 仍有 %d 单残留，保留行', old_code, left)
+                continue
+            conn.execute('DELETE FROM choice_items WHERE kind=? AND code=?', ('source', old_code))
+            conn.execute('DELETE FROM settings WHERE key=?', (f'cal_source_{old_code}',))
         # 费率快照级联（同事务；平台标记已迁移，重算口径自洽）
         if affected_ids:
-            resnapshot_fee_for_renamed_source(conn, affected_ids, new_name)
+            resnapshot_fee_for_renamed_source(conn, affected_ids, target_code)
     _invalidate_choices_cache()
     total = sum(merged.values())
     logger.info('来源合并：%s → 「%s」，共更新 %d 单', list(merged.keys()), new_name, total)
     return {'merged': merged, 'total': total}
-
-
-def apply_source_deletions(conn, new_list_value, new_platform_value,
-                           confirmed_names) -> tuple:
-    """设置保存时的来源删除处理（D9）：对比 source_list 新旧值分类处置。
-
-    - 无引用：清理专属设置键（default_fee_/cal_source_），列表移除生效；
-    - 有引用且已确认（confirmed_names，前端确认对话框产出）：orders.source
-      置空 + 清理设置键；
-    - 有引用且未确认：保留该来源——回填进新列表；如原为平台来源且新
-      platform_sources 漏掉，同步回填（表单勾选框随 DOM 删除已丢失）。
-    在传入事务连接上执行不 commit；缓存失效由随后的 update_settings 统一处理。
-    返回 (修正后 source_list 或 None, 修正后 platform_sources 或 None)；
-    入参 None 表示本次保存未提交该字段，原样返回。
-    """
-    if new_list_value is None:
-        return (None, new_platform_value)
-    old_row = conn.execute(
-        "SELECT value FROM settings WHERE key = 'source_list'"
-    ).fetchone()
-    if not old_row:
-        return (new_list_value, new_platform_value)
-    confirmed = {x.strip() for x in (confirmed_names or []) if x.strip()}
-    olds = [x.strip() for x in old_row['value'].split(',') if x.strip()]
-    news = [x.strip() for x in new_list_value.split(',') if x.strip()]
-    news_set = set(news)
-    old_plat_row = conn.execute(
-        "SELECT value FROM settings WHERE key = 'platform_sources'"
-    ).fetchone()
-    old_plats = ({x.strip() for x in old_plat_row['value'].split(',') if x.strip()}
-                 if old_plat_row else set())
-    plats = ([x.strip() for x in new_platform_value.split(',') if x.strip()]
-             if new_platform_value is not None else None)
-    for s in olds:
-        if s in news_set:
-            continue
-        cnt = conn.execute(
-            "SELECT COUNT(*) FROM orders WHERE source = ?", (s,)
-        ).fetchone()[0]
-        if cnt == 0:
-            _purge_source_settings_keys(conn, s)
-        elif s in confirmed:
-            conn.execute(
-                "UPDATE orders SET source = '', updated_at = datetime('now','localtime') "
-                "WHERE source = ?", (s,)
-            )
-            _purge_source_settings_keys(conn, s)
-            logger.info('来源删除（D9 确认）：「%s」%d 单引用置空', s, cnt)
-        else:
-            news.append(s)
-            if plats is not None and s in old_plats and s not in plats:
-                plats.append(s)
-            logger.warning('来源「%s」被 %d 单引用且未确认删除，已保留（D9 保护）', s, cnt)
-    return (','.join(news), ','.join(plats) if plats is not None else None)
 
 
 # 订单模板可复用字段白名单（P18-F3：排除日期与金额派生）
@@ -1654,23 +3116,46 @@ def update_order_template(template_id: int, name: str, data: dict) -> None:
 
 
 def get_source_list() -> list[str]:
-    """获取所有来源列表（从设置读取）"""
-    try:
-        s = get_all_settings()
-        raw = s.get('source_list', '米画师,B站工坊,画加,微信,QQ,其他')
-        return [x.strip() for x in raw.split(',') if x.strip()]
-    except Exception:
-        return ['米画师', 'B站工坊', '画加', '微信', 'QQ', '其他']
+    """所有来源显示名（按用户原序）。
+
+    Spec 33 卡 159：数据源从 settings `source_list` 换成 choice_items 表，
+    但**返回值仍是 label（中文显示名）** —— 值空间换码属卡 160/164，本卡零行为变化。
+    """
+    rows = get_choice_rows('source')
+    if rows:
+        return [r['label'] for r in rows]
+    return [CODE_TO_LABEL['source'][c] for c in CODE_TO_LABEL['source']]
 
 
 def get_platform_sources() -> set[str]:
-    """获取平台来源集合（从设置读取）"""
-    try:
-        s = get_all_settings()
-        raw = s.get('platform_sources', '米画师,B站工坊,画加')
-        return {x.strip() for x in raw.split(',') if x.strip()}
-    except Exception:
-        return {'米画师', 'B站工坊', '画加'}
+    """平台来源显示名集合（choice_items.is_platform 列）。
+
+    卡 159 仍返回 label 集合；`get_default_fee_for_source` 的「非平台 → 0.0」
+    门控语义一字未改（实测库里 default_fee_ 对非平台来源也有惰性值，全靠这道门
+    才没生效，门一撤就会给微信/QQ 单凭空加 5% 手续费）。
+    """
+    rows = get_choice_rows('source')
+    if rows:
+        return {r['label'] for r in rows if r['is_platform']}
+    legacy = get_all_settings().get('platform_sources', '')
+    plats = {x.strip() for x in legacy.split(',') if x.strip()}
+    if not plats:
+        logger.warning('get_platform_sources: choice_items 与 settings 均无平台来源，返回空集')
+    return plats
+
+
+def get_platform_source_codes() -> set[str]:
+    """平台来源 code 集合 —— 模板做「本单来源是不是平台」判断专用。
+
+    卡 169 D-2：`get_platform_sources()` 给的是**标签**（界面文案用），模板里却拿
+    `order.source`（code）去比对，永远比不中 → 平台单渲染成「定金/尾款」块。
+    code 空间判断必须用本函数。
+    """
+    rows = get_choice_rows('source')
+    if rows:
+        return {r['code'] for r in rows if r['is_platform']}
+    # 表未播种时的兜底：get_choice_rows 走内置回退，其 is_platform 同样取自该常量
+    return set(BUILTIN_PLATFORM_CODES)
 
 
 def reset_settings() -> None:
@@ -1839,7 +3324,9 @@ def _calc_financials(data: dict) -> dict:
     base = data['discounted_income']  # 手续费基数：折后金额（D4 先折后费）
 
     source = data.get('source', '')
-    is_platform = source in get_platform_sources()
+    # 卡 169 D-2：来源在写入管线里是 code，平台集合也按 code 存；拿 code 比标签集
+    # 会把每一笔平台单都判成「非平台」→ 手续费静默归零、实收虚高。
+    is_platform = (resolve_choice_code('source', source) or source) in get_platform_source_codes()
 
     if not is_platform:
         # 直接来源：无手续费
@@ -1895,8 +3382,8 @@ def create_order(data: dict) -> int:
                     'estimated_hours', 'work_hours', 'stage_flow',
                     'discount_pct'}  # Spec19：NULL = 不打折（D2）
         # P19-F4 文本列缺省写列 DEFAULT/''，禁止写数字 0（修复幽灵值来源之一）
-        text_defaults = {'project_name': '', 'source': '米画师', 'current_stage': '待开始',
-                         'ddl_status': '正常', 'payment_status': '未收款'}
+        text_defaults = {'project_name': '', 'source': 'mihuashi', 'current_stage': 'pending',
+                         'ddl_status': 'normal', 'payment_status': 'unpaid'}
         row = {}
         for k in columns:
             val = data.get(k)
@@ -1952,8 +3439,8 @@ def create_order_with_template(data: dict, template_name: str | None = None,
                     'platform_url', 'page_deadline', 'scheduled_start', 'scheduled_end', 'completed_at',
                     'estimated_hours', 'work_hours', 'stage_flow',
                     'discount_pct'}  # Spec19：NULL = 不打折（D2）
-        text_defaults = {'project_name': '', 'source': '米画师', 'current_stage': '待开始',
-                         'ddl_status': '正常', 'payment_status': '未收款'}
+        text_defaults = {'project_name': '', 'source': 'mihuashi', 'current_stage': 'pending',
+                         'ddl_status': 'normal', 'payment_status': 'unpaid'}
         row = {}
         for k in columns:
             val = data.get(k)
@@ -2064,7 +3551,7 @@ def update_order(order_id: int, data: dict, conn=None) -> tuple:
                 return (False, f'本单已有 {cnt} 笔收款记录，清空后才能切回整单收款')
         if target_mode == 'installment':
             # 免收互斥（spec §3.2：免收走 simple 归档语义；覆盖切向与置免收双向组合）
-            if merged.get('payment_status') == '免收':
+            if enum_code_or_raw('payment', merged.get('payment_status')) == 'waived':
                 return (False, '免收订单与分期收款互斥（免收按整单归档语义处理）')
             # D12①：金额改小 → 重算后净额不得低于已到账（容差 0.01）
             if needs_financials:
@@ -2257,8 +3744,8 @@ def _settle_if_received_full(order: dict, received: float, conn) -> bool:
     （payment_status 判定用旧值）。返回是否触发了结算。
     """
     target = float(order.get('actual_received') or 0)
-    if order.get('payment_status') == '未收款' and received >= target - PAYMENT_EPSILON:
-        update_order(order['id'], {'payment_status': '已结算'}, conn=conn)
+    if enum_code_or_raw('payment', order.get('payment_status')) == 'unpaid' and received >= target - PAYMENT_EPSILON:
+        update_order(order['id'], {'payment_status': 'settled'}, conn=conn)
         return True
     return False
 
@@ -2721,17 +4208,18 @@ def get_orders_for_gantt() -> list[dict]:
 
     stage_progress = {name: m['progress'] for name, m in STAGE_META.items()}  # P19-F2：进度取自元数据
     stage_class = {
-        '待开始': 'stage-pending', '色稿': 'stage-sketch',
-        '线稿': 'stage-lineart', '细化': 'stage-detail',
-        '收尾': 'stage-finish', '完成': 'stage-completed',
-        '退单': 'stage-cancelled'
+        'pending': 'stage-pending', 'sketch': 'stage-sketch',
+        'lineart': 'stage-lineart', 'detail': 'stage-detail',
+        'finish': 'stage-finish', 'completed': 'stage-completed',
+        'cancelled': 'stage-cancelled'
     }
 
     result = []
     for r in rows:
         r = dict(r)
-        classes = [stage_class.get(r['current_stage'], '')]
-        if r['ddl_status'] == '🔴逾期':
+        _stage_code = enum_code_or_raw('stage', r['current_stage'])
+        classes = [stage_class.get(_stage_code, '')]
+        if is_overdue_ddl(r['ddl_status']):
             classes.append('overdue')
         if r['is_archived']:
             classes.append('archived')
@@ -2741,10 +4229,11 @@ def get_orders_for_gantt() -> list[dict]:
             'name': f"{r['customer_name'] or ''}-{r['project_name']}" if r['customer_name'] else r['project_name'],
             'start': r['scheduled_start'] or '',
             'end': r['scheduled_end'] or '',
-            'progress': stage_progress.get(r['current_stage'], 0),
+            'progress': stage_progress.get(_stage_code, 0),
             'dependencies': '',
             'custom_class': ' '.join(c for c in classes if c),
-            'current_stage': r['current_stage'],
+            'current_stage': enum_label('stage', r['current_stage']),
+            'stage_code': _stage_code,
             'is_archived': r['is_archived'],
         })
 
@@ -2754,29 +4243,29 @@ def get_orders_for_gantt() -> list[dict]:
 # 日历着色调色板
 CALENDAR_PALETTES = {
     'stage': {
-        '待开始': '#b0b0aa', '色稿': '#6b8eb8', '线稿': '#5b9e9e',
-        '细化': '#c49b4a', '收尾': '#8b7ec8', '完成': '#5b9e6b',
-        '退单': '#c4756b'
+        'pending': '#b0b0aa', 'sketch': '#6b8eb8', 'lineart': '#5b9e9e',
+        'detail': '#c49b4a', 'finish': '#8b7ec8', 'completed': '#5b9e6b',
+        'cancelled': '#c4756b'
     },
     'source': {
         # Validated categorical — slots 1-4
-        '米画师': '#2a78d6', 'B站工坊': '#1baf7a',
-        '微信': '#eda100', '其他': '#008300'
+        'mihuashi': '#2a78d6', 'bili': '#1baf7a',
+        'wechat': '#eda100', 'other': '#008300'
     },
     'ddl': {
         # Status-adjacent — good/warning/critical + muted
-        '正常': '#0ca30c', '即将到期': '#fab219',
-        '🔴逾期': '#d03b3b', '已完成✅': '#898781'
+        'normal': '#0ca30c', 'due': '#fab219',
+        'overdue': '#d03b3b', 'done': '#898781'
     },
     'payment': {
-        '已收定金': '#2a78d6', '未收款': '#fab219', '已结算': '#0ca30c',
-        '欠款': '#d03b3b', '免收': '#008300'
+        'deposit_paid': '#2a78d6', 'unpaid': '#fab219', 'settled': '#0ca30c',
+        'debt': '#d03b3b', 'waived': '#008300'
     },
     'commission': {
         # ≥8 categories → fold into "Other" per dataviz rule
-        '单人半身': '#2a78d6', '色稿大头': '#1baf7a', '双人横插': '#eda100',
-        '立绘': '#008300', '场景插画': '#4a3aa7', 'Q版': '#e34948',
-        '服设': '#e87ba4', '厚涂头像': '#eb6834'
+        'cmt_001': '#2a78d6', 'cmt_002': '#1baf7a', 'cmt_003': '#eda100',
+        'cmt_004': '#008300', 'cmt_005': '#4a3aa7', 'cmt_006': '#e34948',
+        'cmt_007': '#e87ba4', 'cmt_008': '#eb6834'
     },
 }
 
@@ -2833,24 +4322,25 @@ def _auto_stage_fallback_colors(palette: dict) -> None:
 
 
 def _calendar_filter_sql(filters: dict | None) -> tuple:
-    """P13b F1 级联筛选：阶段/来源/类别/客户/收款状态 → (where 片段列表, params)"""
+    """P13b F1 级联筛选：阶段/来源/类别/客户/收款状态 → (where 片段列表, params)
+    Spec33 卡 166：入参先归一（旧中文书签 ?stage=完成 与 ?stage=completed 同结果）。"""
     where, params = [], []
     filters = filters or {}
     if filters.get('stage'):
         where.append("o.current_stage = ?")
-        params.append(filters['stage'])
+        params.append(enum_code_or_raw('stage', filters['stage']))
     if filters.get('source'):
         where.append("o.source = ?")
-        params.append(filters['source'])
+        params.append(resolve_choice_code('source', filters['source']) or filters['source'])
     if filters.get('commission_type'):
         where.append("o.commission_type = ?")
-        params.append(filters['commission_type'])
+        params.append(resolve_choice_code('commission_type', filters['commission_type']) or filters['commission_type'])
     if filters.get('customer_id'):
         where.append("o.customer_id = ?")
         params.append(filters['customer_id'])
     if filters.get('payment_status'):
         where.append("o.payment_status = ?")
-        params.append(filters['payment_status'])
+        params.append(enum_code_or_raw('payment', filters['payment_status']))
     return where, params
 
 
@@ -2935,13 +4425,18 @@ def get_orders_for_calendar(color_mode: str = 'source', filters: dict | None = N
             'borderColor': color,
             'extendedProps': {
                 'customer_name': r['customer_name'],
-                'stage': r['current_stage'],
-                'source': r['source'],
-                'ddl': r['ddl_status'],
-                'payment': r['payment_status'],
-                'commission': r['commission_type'],
+                'stage': enum_label('stage', r['current_stage']),
+                'source': choice_label('source', r['source']) if r['source'] else r['source'],
+                'ddl': enum_label('ddl', r['ddl_status']),
+                'payment': enum_label('payment', r['payment_status']),
+                'commission': choice_label('commission_type', r['commission_type']) if r['commission_type'] else r['commission_type'],
+                'stage_code': enum_code_or_raw('stage', r['current_stage']),
+                'source_code': resolve_choice_code('source', r['source']) or r['source'],
+                'ddl_code': enum_code_or_raw('ddl', r['ddl_status']),
+                'payment_code': enum_code_or_raw('payment', r['payment_status']),
+                'commission_code': resolve_choice_code('commission_type', r['commission_type']) or r['commission_type'],
                 'income': r['income'],
-                'overdue': r['ddl_status'] == '🔴逾期',
+                'overdue': is_overdue_ddl(r['ddl_status']),
                 'custom_color': r.get('custom_color'),
                 'color_mode': color_mode,
             }
@@ -3471,6 +4966,9 @@ def metric_type_distribution(conn=None, year: int = None, month: int = None) -> 
     每品类：cnt 单数 / gross=SUM(income) 应收（毛）/ net=SUM(actual_received) 实收（净）。
 
     year/month: 可选筛选，按排期月份（scheduled_start）过滤；未排期单不计入统计。
+
+    Spec 35 D1/D3：返回项附 label 供显示，commission_type 原值保留供配色查找
+    （COMMISSION_COLORS 的键是 code）；choice_items 无对应行的值原样直通。
     """
     c, close = _metric_conn(conn)
     where_parts = ["is_archived = 1", "commission_type IS NOT NULL", "commission_type != ''"]
@@ -3493,7 +4991,13 @@ def metric_type_distribution(conn=None, year: int = None, month: int = None) -> 
     """, params).fetchall()
     if close:
         c.close()
-    return [dict(r) for r in rows]
+    label_map = {r['code']: r['label'] for r in get_choice_rows('commission_type')}
+    result = []
+    for r in rows:
+        item = dict(r)
+        item['label'] = label_map.get(item['commission_type'], item['commission_type'])
+        result.append(item)
+    return result
 
 
 def get_dashboard_stats(start_date: str = None, end_date: str = None, preset: str = 'month') -> dict:
@@ -3961,8 +5465,13 @@ def _hourly_group_stats(group_col: str, year: int, month: int = None) -> list[di
     sql += " GROUP BY name"
     rows = conn.execute(sql, sql_params).fetchall()
     conn.close()
+    # 卡168 code 化后 group_col 存的是 code，经 choice_items 翻成中文显示名；
+    # 查不到（老库未迁移中文脏值 / '未分类'）原样直通。name 供显示，code 供配色查找
+    # （SOURCE_COLORS/COMMISSION_COLORS 键为 code）。
+    label_map = {r['code']: r['label'] for r in get_choice_rows(group_col)}
     result = [{
-        'name': r['name'],
+        'name': label_map.get(r['name'], r['name']),
+        'code': r['name'],
         'rate': _weighted_rate(r['amt'], r['hrs']),
         'count': r['cnt'],
         'hours': round(r['hrs'], 1),
@@ -4171,14 +5680,16 @@ def recalc_customer_stats(customer_id: int, conn=None) -> None:
     own = conn is None
     if own:
         conn = get_db()
+    done_vals = _enum_sql_values('stage', {get_done_stage()})
+    paid_vals = _enum_sql_values('payment', get_paid_statuses())
     row = conn.execute(
-        """SELECT COUNT(*) as cnt, COALESCE(SUM(actual_received), 0) as total
+        f"""SELECT COUNT(*) as cnt, COALESCE(SUM(actual_received), 0) as total
            FROM orders
            WHERE customer_id = ?
              AND is_archived = 1
-             AND current_stage = '完成'
-             AND payment_status = '已结算'""",
-        (customer_id,)
+             AND current_stage IN ({','.join('?' * len(done_vals))})
+             AND payment_status IN ({','.join('?' * len(paid_vals))})""",
+        [customer_id] + done_vals + paid_vals
     ).fetchone()
     conn.execute(
         "UPDATE customers SET total_spent = ?, purchase_count = ?, updated_at = datetime('now','localtime') WHERE id = ?",

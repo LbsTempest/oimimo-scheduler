@@ -10,24 +10,34 @@ from datetime import date, datetime
 from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Literal, Optional
 
+import db
+
 # P19-F12 移除 STAGE_CHOICES/SOURCE_CHOICES/DDL_CHOICES/PAYMENT_CHOICES 死代码：
 # 所有选择字段值从 db.get_choices() 动态获取（注册表 + settings 自定义 + auto-discover）；
-# 平台来源判定见 PLATFORM_SOURCES/DIRECT_SOURCES。
+# 「是否平台来源（有手续费）」是 choice_items.is_platform 列，经 db.get_platform_sources()
+# 读取并由 app.py 注入模板全局 PLATFORM_SOURCES。
+# Spec 33 卡 159：删除此处两个硬编码投影常量 —— 它们是同一布尔属性的两份副本，
+# 且与本库实际设置可能不一致（实测本库米画师**不是**平台，硬编码里却是）。
+# DIRECT_SOURCES 全项目零引用，属死代码。
 
-# 平台类来源（有手续费）
-PLATFORM_SOURCES = {'米画师', 'B站工坊', '画加'}
-# 直接来源（无手续费）
-DIRECT_SOURCES = {'微信', 'QQ', '其他'}
+# Spec 33 卡 164：字段名 → 枚举 kind 映射（validator 用）
+FIELD_TO_ENUM_KIND = {
+    'source': 'source',
+    'current_stage': 'stage',
+    'ddl_status': 'ddl',
+    'payment_status': 'payment',
+    'commission_type': 'commission_type',
+}
 
 
 class OrderCreate(BaseModel):
     customer_id: Optional[int] = None
     project_name: str = Field(..., min_length=1, max_length=500)
-    source: str = Field(default='米画师')
+    source: str = Field(default='mihuashi')
     is_commercial: bool = False
     commission_type: Optional[str] = None
-    current_stage: str = Field(default='待开始')
-    ddl_status: str = Field(default='正常')
+    current_stage: str = Field(default='pending')
+    ddl_status: str = Field(default='normal')
     deposit: float = Field(default=0.0, ge=0)
     balance: float = Field(default=0.0, ge=0)
     platform_fee_pct: Optional[float] = Field(default=None, ge=0, le=100)
@@ -36,7 +46,7 @@ class OrderCreate(BaseModel):
     discount_pct: Optional[float] = Field(default=None, gt=0, le=100)
     # Spec 26 收款模式：simple=一次性（虚拟事件，按排期月计收入）/ installment=分期（order_payments 流水）
     payment_mode: Literal['simple', 'installment'] = 'simple'
-    payment_status: str = Field(default='未收款')  # P19-F4 默认值归一（锁定 5 值之一）
+    payment_status: str = Field(default='unpaid')  # P19-F4 默认值归一（锁定 5 值之一）
     platform_url: Optional[str] = None
     page_deadline: Optional[str] = None
     notes: Optional[str] = None
@@ -50,6 +60,22 @@ class OrderCreate(BaseModel):
     # Spec12 阶段流程快照（JSON 字符串；实际结构校验交给 db.validate_stage_flow）
     stage_flow: Optional[str] = None
     # 所有选择字段不再硬编码校验 — 值从 db.get_choices() 动态获取
+
+    # Spec 33 卡 164：归一化枚举 token——接受 code 或旧中文 label，
+    # 识别得了换 code、识别不了原样放行（自定义阶段/历史脏值）
+    # Spec 33 卡 168：用户枚举（来源/类别）额外登记 —— 全新中文值当场建行并落 code，
+    # 否则界面按 code 反查会漏中文（卡 164 只做转换不做登记，是本卡修的洞）
+    @field_validator('source', 'current_stage', 'ddl_status', 'payment_status', 'commission_type', mode='before')
+    @classmethod
+    def _normalize_enum_token(cls, v, info):
+        if not isinstance(v, str) or not v:
+            return v
+        kind = FIELD_TO_ENUM_KIND.get(info.field_name)
+        if not kind:
+            return v
+        if kind in ('source', 'commission_type'):
+            return db.ensure_choice_code(kind, v)
+        return db.enum_code_or_raw(kind, v)
 
     @field_validator('estimated_hours', 'work_hours', mode='before')
     @classmethod

@@ -57,12 +57,12 @@
         <div class="form-row">
             <div class="form-group">
                 <label for="source">来源</label>
-                <input type="text" name="source" list="modal-source-list" value="{{ prefill.source or '米画师' }}" autocomplete="off">
+                <input type="text" name="source" list="modal-source-list" value="{{ prefill.source|source_label or '米画师' }}" autocomplete="off">
                 <datalist id="modal-source-list">{% for s in existing_sources %}<option value="{{ s }}">{% endfor %}</datalist>
             </div>
             <div class="form-group">
                 <label for="commission_type">稿件类别</label>
-                <input type="text" name="commission_type" list="modal-type-list" value="{{ prefill.commission_type or '' }}" autocomplete="off">
+                <input type="text" name="commission_type" list="modal-type-list" value="{{ prefill.commission_type|commission_label }}" autocomplete="off">
                 <datalist id="modal-type-list">{% for t in existing_types %}<option value="{{ t }}">{% endfor %}</datalist>
             </div>
         </div>
@@ -75,7 +75,7 @@
                 <label for="current_stage">阶段</label>
                 <select name="current_stage" id="modal-stage-select">
                     {% for s in STAGE_CHOICES %}
-                    <option value="{{ s }}" {% if s == (prefill.current_stage or '待开始') %}selected{% endif %}>{{ s }}</option>
+                    <option value="{{ s.code }}" {% if s.code == (prefill.current_stage or pending_stage_code()) %}selected{% endif %}>{{ s.label }}</option>
                     {% endfor %}
                 </select>
             </div>
@@ -94,7 +94,7 @@
             <label for="payment_status">收款</label>
             <select name="payment_status">
                 {% for s in PAYMENT_CHOICES %}
-                <option value="{{ s }}" {% if s == (prefill.payment_status or '未收款') %}selected{% endif %}>{{ s }}</option>
+                <option value="{{ s.code }}" {% if s.code == (prefill.payment_status or unpaid_status_code()) %}selected{% endif %}>{{ s.label }}</option>
                 {% endfor %}
             </select>
         </div>
@@ -130,7 +130,7 @@
         <div class="form-row">
             <div class="form-group" id="modal-fee-field">
                 <label for="platform_fee_pct">手续费 (%)</label>
-                <input type="number" name="platform_fee_pct" step="0.1" min="0" max="100" value="{{ prefill.platform_fee_pct if prefill and prefill.platform_fee_pct is not none else '%.1f'|format(DEFAULT_FEES.get(prefill.source or '米画师', 5)) }}" oninput="calcModalActual()">
+                <input type="number" name="platform_fee_pct" step="0.1" min="0" max="100" value="{{ prefill.platform_fee_pct if prefill and prefill.platform_fee_pct is not none else '%.1f'|format(DEFAULT_FEES.get(prefill.source|source_label or '米画师', 5)) }}" oninput="calcModalActual()">
             </div>
             {# Spec19：订单级折扣（留空 = 不打折；选客户自动带出） #}
             <div class="form-group">
@@ -264,6 +264,8 @@ setTimeout(function() {
 
 // Spec12：流程预设下拉 → 同步 stage_flow 隐藏字段 + 更新阶段 select
 var _MODAL_FLOWS = {{ STAGE_FLOWS | tojson }};
+// Spec33 卡 168：流程快照里的 name 已是 code（M6/M7/M15 转码），下拉显示必须翻中文
+var STAGE_LABEL_MAP = {{ ENUM_LABELS.stage | tojson }};
 function onModalFlowPresetChange() {
     var sel = document.getElementById('stage-flow-preset');
     var idx = parseInt(sel.value, 10);
@@ -278,7 +280,7 @@ function onModalFlowPresetChange() {
             stageSelect.innerHTML = '';
             stages.forEach(function(s) {
                 var opt = document.createElement('option');
-                opt.value = s.name; opt.textContent = s.name;
+                opt.value = s.name; opt.textContent = (STAGE_LABEL_MAP[s.name] || s.name);
                 stageSelect.appendChild(opt);
             });
         }

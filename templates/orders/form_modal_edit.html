@@ -77,19 +77,19 @@
     <div class="form-row">
         <div class="form-group">
             <label>来源</label>
-            <input type="text" name="source" list="modal-edit-source-list" value="{{ order.source }}" placeholder="输入或选择..." autocomplete="off">
+            <input type="text" name="source" list="modal-edit-source-list" value="{{ order.source|source_label }}" placeholder="输入或选择..." autocomplete="off">
             <datalist id="modal-edit-source-list">{% for s in existing_sources %}<option value="{{ s }}">{% endfor %}</datalist>
         </div>
         <div class="form-group">
             <label>当前阶段</label>
             <select name="current_stage" id="modal-edit-stage-select">
                 {% for s in order._stage_flow_parsed %}
-                <option value="{{ s.name }}" {% if order.current_stage == s.name %}selected{% endif %}>{{ s.name }}</option>
+                <option value="{{ s.name }}" {% if order.current_stage == s.name %}selected{% endif %}>{{ s.name|stage_label }}</option>
                 {% endfor %}
-                {% if order.current_stage == '退单' %}
-                <option value="退单" selected>退单</option>
+                {% if order.current_stage is refund_stage %}
+                <option value="{{ refund_stage_code() }}" selected>{{ refund_stage_code()|stage_label }}</option>
                 {% else %}
-                <option value="退单">退单</option>
+                <option value="{{ refund_stage_code() }}">{{ refund_stage_code()|stage_label }}</option>
                 {% endif %}
             </select>
         </div>
@@ -100,14 +100,14 @@
         <div class="form-group">
             <label>DDL状态</label>
             <div style="padding:8px 12px;background:var(--color-bg);border-radius:var(--radius-sm);font-size:0.85rem;color:var(--color-text-secondary);">
-                ⚡ {{ order.ddl_status }}
+                ⚡ {{ order.ddl_status|ddl_label }}
             </div>
         </div>
         <div class="form-group">
             <label>收款状态</label>
             <select name="payment_status">
                 {% for s in PAYMENT_CHOICES %}
-                <option value="{{ s }}" {% if order.payment_status == s %}selected{% endif %}>{{ s }}</option>
+                <option value="{{ s.code }}" {% if order.payment_status == s.code %}selected{% endif %}>{{ s.label }}</option>
                 {% endfor %}
             </select>
         </div>
@@ -133,7 +133,8 @@
                value="{{ order.discount_pct if order.discount_pct is not none else '' }}"
                placeholder="留空 = 不打折" oninput="calcModalEditActual()" id="modal-edit-discount-pct">
     </div>
-    {% set is_plat = order.source in PLATFORM_SOURCES %}
+    {# 卡 169 D-2：平台判断必须 code 比 code #}
+    {% set is_plat = order.source in PLATFORM_CODES %}
     <div id="modal-edit-finance-platform" style="{{ 'display:none;' if not is_plat else '' }}">
         <div class="form-row">
             <div class="form-group">
@@ -143,7 +144,7 @@
             <div class="form-group">
                 <label>手续费 (%)</label>
                 <input type="number" name="platform_fee_pct" step="0.1" min="0" max="100"
-                       value="{{ '%.1f'|format(order.platform_fee_pct if order.platform_fee_pct is not none else DEFAULT_FEES.get(order.source, 5)) }}" oninput="calcModalEditActual()" id="modal-edit-pct" {{ 'disabled' if not is_plat }}>
+                       value="{{ '%.1f'|format(order.platform_fee_pct if order.platform_fee_pct is not none else DEFAULT_FEES.get(order.source|source_label, 5)) }}" oninput="calcModalEditActual()" id="modal-edit-pct" {{ 'disabled' if not is_plat }}>
             </div>
         </div>
         <div style="margin-top:var(--space-sm);padding:10px;background:var(--color-bg);border-radius:var(--radius-sm);font-size:0.85rem;display:flex;gap:var(--space-lg);">
@@ -175,7 +176,7 @@
     <div class="form-row" style="margin-top:var(--space-md);">
         <div class="form-group">
             <label>稿件类别</label>
-            <input type="text" name="commission_type" list="modal-edit-type-list" value="{{ order.commission_type or '' }}" placeholder="输入或选择..." autocomplete="off">
+            <input type="text" name="commission_type" list="modal-edit-type-list" value="{{ order.commission_type|commission_label }}" placeholder="输入或选择..." autocomplete="off">
             <datalist id="modal-edit-type-list">{% for t in existing_types %}<option value="{{ t }}">{% endfor %}</datalist>
         </div>
         <div class="form-group date-field">
@@ -279,6 +280,8 @@ setTimeout(function() {
 
 // Spec12：流程预设切换 → 更新 stage_flow 隐藏字段 + 阶段 select
 var _MODAL_EDIT_FLOWS = {{ STAGE_FLOWS | tojson }};
+// Spec33 卡 168：流程快照里的 name 已是 code（M6/M7/M15 转码），下拉显示必须翻中文
+var STAGE_LABEL_MAP = {{ ENUM_LABELS.stage | tojson }};
 var _MODAL_EDIT_ORIGINAL_FLOW = '{{ order._stage_flow_parsed | tojson | replace("'", "\\'") }}';
 function onModalEditFlowPresetChange() {
     var sel = document.getElementById('modal-edit-stage-flow-preset');
@@ -293,7 +296,7 @@ function onModalEditFlowPresetChange() {
             stageSelect.innerHTML = '';
             orig.forEach(function(s) {
                 var opt = document.createElement('option');
-                opt.value = s.name; opt.textContent = s.name;
+                opt.value = s.name; opt.textContent = (STAGE_LABEL_MAP[s.name] || s.name);
                 if (s.name === curVal) opt.selected = true;
                 stageSelect.appendChild(opt);
             });
@@ -313,7 +316,7 @@ function onModalEditFlowPresetChange() {
             stageSelect.innerHTML = '';
             flow.stages.forEach(function(s) {
                 var opt = document.createElement('option');
-                opt.value = s.name; opt.textContent = s.name;
+                opt.value = s.name; opt.textContent = (STAGE_LABEL_MAP[s.name] || s.name);
                 stageSelect.appendChild(opt);
             });
             var retOpt = document.createElement('option');

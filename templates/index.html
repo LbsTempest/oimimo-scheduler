@@ -97,7 +97,7 @@
                             <tr style="cursor:pointer" onclick="openEditDrawer({{ o.id }})">
                                 <td>{{ o.customer_name or '-' }}</td>
                                 <td><strong>{{ o.project_name }}</strong></td>
-                                <td><span class="stage-badge {{ o.current_stage|stage_class }}">{{ o.current_stage }}</span></td>
+                                <td><span class="stage-badge {{ o.current_stage|stage_class }}">{{ o.current_stage|stage_label }}</span></td>
                                 <td>{{ o.scheduled_end or '-' }}
                                     {% if o.days_remaining is defined and o.days_remaining is not none and not o.is_archived %}
                                         {% if o.days_remaining < 0 %}
@@ -112,7 +112,7 @@
                                 <td><span class="amount">¥{{ "%.0f"|format(o.income) }}</span></td>
                                 <td>
                                     {% if o.is_archived %}<span style="color:var(--color-text-tertiary);font-size:0.75rem;">已归档</span>
-                                    {% elif o.ddl_status == '🔴逾期' %}<span class="status-badge overdue">逾期</span>
+                                    {% elif o.ddl_status is overdue_ddl %}<span class="status-badge overdue">逾期</span>
                                     {% elif o.ddl_status == '即将到期' %}<span class="status-badge due-soon">即将到期</span>
                                     {% else %}<span class="status-badge normal">正常</span>{% endif %}
                                 </td>
@@ -137,7 +137,7 @@
                             <tr style="cursor:pointer" onclick="openEditDrawer({{ o.id }})">
                                 <td>{{ o.customer_name or '-' }}</td>
                                 <td><strong>{{ o.project_name }}</strong></td>
-                                <td><span class="stage-badge {{ o.current_stage|stage_class }}">{{ o.current_stage }}</span></td>
+                                <td><span class="stage-badge {{ o.current_stage|stage_class }}">{{ o.current_stage|stage_label }}</span></td>
                                 <td style="color:var(--color-danger);font-weight:600;">{{ o.scheduled_end or '-' }}
                                     {% if o.days_remaining is defined and o.days_remaining is not none %}
                                         <span style="font-size:0.72rem;">逾期{{ -o.days_remaining }}天</span>

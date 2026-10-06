@@ -25,8 +25,8 @@
         </div>
         <div class="tpl-card-summary">
             {% set parts = [] %}
-            {% if t.data.source %}{% set _ = parts.append(t.data.source) %}{% endif %}
-            {% if t.data.commission_type %}{% set _ = parts.append(t.data.commission_type) %}{% endif %}
+            {% if t.data.source %}{% set _ = parts.append(t.data.source|source_label) %}{% endif %}
+            {% if t.data.commission_type %}{% set _ = parts.append(t.data.commission_type|commission_label) %}{% endif %}
             {% if (t.data.deposit or 0)|float + (t.data.balance or 0)|float > 0 %}
             {% set _ = parts.append('金额 ¥%.2f' % ((t.data.deposit or 0)|float + (t.data.balance or 0)|float)) %}
             {% endif %}

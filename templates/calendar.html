@@ -100,9 +100,9 @@ function onFilterDimChange() {
         return;
     }
     const opts = FILTER_OPTIONS[dim] || [];
+    // 卡 168：所有维度统一 {code, label}——option 的 value=code（查询用），显示=中文
     valSel.innerHTML = '<option value="">全部</option>' + opts.map(function(o) {
-        if (typeof o === 'object') return '<option value="' + o.id + '">' + escHtml(o.name) + '</option>';
-        return '<option value="' + escHtml(o) + '">' + escHtml(o) + '</option>';
+        return '<option value="' + escHtml(o.code) + '">' + escHtml(o.label) + '</option>';
     }).join('');
     valSel.disabled = false;
     applyPoolFilter();

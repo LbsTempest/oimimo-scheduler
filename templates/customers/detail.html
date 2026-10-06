@@ -76,7 +76,7 @@
             {% if hourly_rate_enabled %}
             {# P20c：加权平均时薪 = SUM(实收)/SUM(实际工时)，口径同 spec12 §3 #}
             {% set ns = namespace(amt=0.0, hrs=0.0) %}
-            {% for o in orders if o.current_stage == '完成' and o.work_hours and o.work_hours > 0 and not o.exclude_hourly %}
+            {% for o in orders if o.current_stage is done_stage and o.work_hours and o.work_hours > 0 and not o.exclude_hourly %}
             {% set ns.amt = ns.amt + (o.actual_received or 0) %}
             {% set ns.hrs = ns.hrs + o.work_hours %}
             {% endfor %}
@@ -123,14 +123,14 @@
                     <td><strong>{{ o.project_name }}</strong></td>
                     <td>
                         <span class="stage-badge {{ o.current_stage|stage_class }}">
-                            {{ o.current_stage }}
+                            {{ o.current_stage|stage_label }}
                         </span>
                     </td>
                     <td>{{ o.scheduled_start or '-' }}</td>
                     <td><span class="amount">¥{{ "%.2f"|format(o.income) }}</span></td>
                     <td><span class="amount positive">¥{{ "%.2f"|format(o.actual_received) }}</span></td>
                     {% if hourly_rate_enabled %}<td>{{ m.hourly_badge(o) }}</td>{% endif %}
-                    <td>{{ o.payment_status }}</td>
+                    <td>{{ o.payment_status|payment_label }}</td>
                 </tr>
                 {% endfor %}
             </tbody>

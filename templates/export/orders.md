@@ -10,14 +10,14 @@
 | 字段 | 值 |
 |---|---|
 | 客户 | {{ o.customer_name or '—' }} |
-| 来源 | {{ o.source }}{% if o.source in platform_sources %}（平台）{% endif %} |
-| 稿件类别 | {{ o.commission_type or '—' }} |
-| 阶段 | {{ o.current_stage }} |
-| DDL状态 | {{ o.ddl_status }} |
+| 来源 | {{ o.source|source_label }}{% if o.source in platform_codes %}（平台）{% endif %} |
+| 稿件类别 | {{ o.commission_type|commission_label or '—' }} |
+| 阶段 | {{ o.current_stage|stage_label }} |
+| DDL状态 | {{ o.ddl_status|ddl_label }} |
 | 排期 | {{ o.scheduled_start.replace('T', ' ') if o.scheduled_start else '—' }} → {{ o.scheduled_end.replace('T', ' ') if o.scheduled_end else '—' }} |
 | 定金 / 尾款 | ¥{{ "%.2f"|format(o.deposit or 0) }} / ¥{{ "%.2f"|format(o.balance or 0) }} |
 | 收入 / 手续费 / 实收 | ¥{{ "%.2f"|format(o.income or 0) }} / ¥{{ "%.2f"|format(o.platform_fee or 0) }} / ¥{{ "%.2f"|format(o.actual_received or 0) }} |
-| 收款状态 | {{ o.payment_status }} |
+| 收款状态 | {{ o.payment_status|payment_label }} |
 | 商用 | {{ '是' if o.is_commercial else '否' }} |
 | 复购 | {{ '是（第 %d 次）'|format(o.repeat_count) if o.is_repeat else '否' }} |
 | 归档 | {{ '是' if o.is_archived else '否' }} |

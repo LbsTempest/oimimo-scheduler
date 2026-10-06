@@ -6,12 +6,12 @@
 {% macro stage_timeline(order) %}
 {% set stages = order.get('_stage_flow_parsed') or [] %}
 {% set cur = order.current_stage %}
-{% set is_refund = (cur == '退单') %}
-{% set is_done = (cur == '完成') %}
+{% set is_refund = (cur is refund_stage) %}
+{% set is_done = (cur is done_stage) %}
 {# 找当前索引 #}
 {% set ns = namespace(idx=-1) %}
 {% for s in stages %}
-    {% if s.name == cur and ns.idx == -1 %}{% set ns.idx = loop.index0 %}{% endif %}
+    {% if s.name|stage_code == cur|stage_code and ns.idx == -1 %}{% set ns.idx = loop.index0 %}{% endif %}
 {% endfor %}
 {% set cur_idx = ns.idx %}
 {% set cur_progress = stages[cur_idx].progress if cur_idx >= 0 else 0 %}
@@ -34,7 +34,7 @@
                 {% endif %}
             </div>
             <div class="stage-timeline-connector-right" aria-hidden="true"></div>
-            <div class="stage-timeline-label">{{ s.name|e }}</div>
+            <div class="stage-timeline-label">{{ s.name|stage_label }}</div>
             {% if is_current %}
             <div class="stage-timeline-pct">{{ s.progress }}%</div>
             {% endif %}

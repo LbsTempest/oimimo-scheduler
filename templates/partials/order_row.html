@@ -5,20 +5,20 @@
     <td style="cursor:pointer" onclick="location.href='/orders/{{ o.id }}'">#{{ o.id }}</td>
     <td style="cursor:pointer" onclick="location.href='/orders/{{ o.id }}'">{{ o.customer_name or '-' }}</td>
     <td style="cursor:pointer" onclick="location.href='/orders/{{ o.id }}'"><strong>{{ o.project_name }}</strong></td>
-    <td style="cursor:pointer" onclick="location.href='/orders/{{ o.id }}'">{{ o.source }}</td>
-    <td style="cursor:pointer" onclick="location.href='/orders/{{ o.id }}'">{{ o.commission_type or '-' }}</td>
+    <td style="cursor:pointer" onclick="location.href='/orders/{{ o.id }}'">{{ o.source|source_label }}</td>
+    <td style="cursor:pointer" onclick="location.href='/orders/{{ o.id }}'">{{ o.commission_type|commission_label or '-' }}</td>
     <td style="cursor:pointer" onclick="location.href='/orders/{{ o.id }}'">
-        <span class="stage-badge {{ o.current_stage|stage_class }}">{{ o.current_stage }}</span>
+        <span class="stage-badge {{ o.current_stage|stage_class }}">{{ o.current_stage|stage_label }}</span>
     </td>
     <td style="cursor:pointer" onclick="location.href='/orders/{{ o.id }}'">
         {% if o.is_archived %}
         <span style="color:var(--color-text-tertiary);font-size:0.78rem;">已归档</span>
         {% else %}
-        {{ o.ddl_status }}
+        {{ o.ddl_status|ddl_label }}
         {% endif %}
     </td>
     <td style="cursor:pointer" onclick="location.href='/orders/{{ o.id }}'">
-        {% if o.source in PLATFORM_SOURCES %}
+        {% if o.source in PLATFORM_CODES %}
         <span class="amount">¥{{ "%.0f"|format(o.income) }}</span>
         <span style="font-size:0.7rem;color:var(--color-text-tertiary);"> -{{ "%.0f"|format(o.platform_fee) }}</span>
         {% else %}
@@ -29,7 +29,7 @@
     {% if hourly_rate_enabled %}
     <td style="cursor:pointer" onclick="location.href='/orders/{{ o.id }}'">{{ m.hourly_badge(o) }}</td>
     {% endif %}
-    <td style="cursor:pointer" onclick="location.href='/orders/{{ o.id }}'">{{ o.payment_status }}</td>
+    <td style="cursor:pointer" onclick="location.href='/orders/{{ o.id }}'">{{ o.payment_status|payment_label }}</td>
     <td style="cursor:pointer;font-size:0.82rem;" onclick="location.href='/orders/{{ o.id }}'">
         {% if o.scheduled_start %}
         {{ o.scheduled_start }} → {{ o.scheduled_end or o.scheduled_start }}

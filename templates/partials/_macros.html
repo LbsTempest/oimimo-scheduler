@@ -3,7 +3,7 @@
 {% macro hourly_badge(order) -%}
 {%- if order.exclude_hourly -%}
 <span class="status-badge hourly-badge-excluded">不计</span>
-{%- elif order.current_stage == '完成' and order.work_hours and order.work_hours > 0 -%}
+{%- elif order.current_stage is done_stage and order.work_hours and order.work_hours > 0 -%}
 <span class="status-badge hourly-badge">¥{{ "%.0f"|format((order.actual_received or 0) / order.work_hours) }}/h</span>
 {%- else -%}
 <span style="color:var(--color-text-tertiary);">—</span>

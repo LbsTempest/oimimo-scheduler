@@ -33,18 +33,18 @@
                 <div class="kv-grid">
                     <div class="kv-row"><span class="kv-key">项目</span><span class="kv-val">{{ order.project_name }}</span></div>
                     <div class="kv-row"><span class="kv-key">客户</span><span class="kv-val">{% if customer %}<a href="/customers/{{ customer.id }}">{{ customer.name }}</a>{% else %}-{% endif %}</span></div>
-                    <div class="kv-row"><span class="kv-key">来源</span><span class="kv-val">{{ order.source }}{% if order.source in PLATFORM_SOURCES %}<span style="font-size:0.7rem;color:var(--color-text-tertiary);margin-left:4px;">平台</span>{% endif %}</span></div>
-                    <div class="kv-row"><span class="kv-key">类别</span><span class="kv-val">{{ order.commission_type or '-' }}</span></div>
+                    <div class="kv-row"><span class="kv-key">来源</span><span class="kv-val">{{ order.source|source_label }}{% if order.source in PLATFORM_CODES %}<span style="font-size:0.7rem;color:var(--color-text-tertiary);margin-left:4px;">平台</span>{% endif %}</span></div>
+                    <div class="kv-row"><span class="kv-key">类别</span><span class="kv-val">{{ order.commission_type|commission_label or '-' }}</span></div>
                     <div class="kv-row"><span class="kv-key">用途</span><span class="kv-val">{{ '商用' if order.is_commercial else '私用' }}</span></div>
                     <div class="kv-row">
                         <span class="kv-key">阶段</span>
-                        <span class="kv-val"><span class="stage-badge {{ order.current_stage|stage_class }}">{{ order.current_stage }}</span></span>
+                        <span class="kv-val"><span class="stage-badge {{ order.current_stage|stage_class }}">{{ order.current_stage|stage_label }}</span></span>
                     </div>
                     <div class="kv-row">
                         <span class="kv-key">DDL</span>
                         <span class="kv-val">
                             {% if order.is_archived %}<span style="color:var(--color-text-tertiary);">已归档</span>
-                            {% else %}{{ order.ddl_status }}{% endif %}
+                            {% else %}{{ order.ddl_status|ddl_label }}{% endif %}
                         </span>
                     </div>
                     {% if order.is_repeat %}
@@ -55,7 +55,7 @@
             <!-- 右栏：财务 + 日期 -->
             <div style="padding:var(--space-md);">
                 <div class="section-label">财务信息</div>
-                {% set is_platform = order.source in PLATFORM_SOURCES %}
+                {% set is_platform = order.source in PLATFORM_CODES %}
                 <div class="kv-grid">
                     {% if is_platform %}
                     <div class="kv-row"><span class="kv-key">平台收入</span><span class="kv-val mono">¥{{ "%.2f"|format(order.income) }}</span></div>
@@ -72,7 +72,7 @@
                         <span class="kv-key" style="font-weight:700;">实收</span>
                         <span class="kv-val mono" style="font-weight:700;color:var(--color-success);">¥{{ "%.2f"|format(order.actual_received) }}</span>
                     </div>
-                    <div class="kv-row"><span class="kv-key">收款</span><span class="kv-val">{{ order.payment_status }}</span></div>
+                    <div class="kv-row"><span class="kv-key">收款</span><span class="kv-val">{{ order.payment_status|payment_label }}</span></div>
                     {% if hourly_rate_enabled %}
                     {# P20c：时薪三行（口径：完成 且 work_hours>0 且未排除） #}
                     <div class="kv-row" style="border-top:1px solid var(--color-border);padding-top:6px;margin-top:2px;">
@@ -80,7 +80,7 @@
                         <span class="kv-val mono">
                             {% if order.exclude_hourly %}
                             <span class="status-badge" style="background:var(--color-bg);color:var(--color-text-tertiary);">已排除统计</span>
-                            {% elif order.current_stage == '完成' and order.work_hours and order.work_hours > 0 %}
+                            {% elif order.current_stage is done_stage and order.work_hours and order.work_hours > 0 %}
                             <span style="color:var(--color-info);font-weight:700;">¥{{ "%.0f"|format((order.actual_received or 0) / order.work_hours) }}/h</span>
                             {% else %}
                             — <a href="/orders/{{ order.id }}/edit" style="font-size:0.72rem;color:var(--color-info);">补录工时</a>

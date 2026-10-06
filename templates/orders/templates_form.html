@@ -25,13 +25,13 @@
     <div class="form-row">
         <div class="form-group">
             <label>来源</label>
-            <input type="text" name="source" list="tpl-source-list" value="{{ d.source or '' }}" autocomplete="off">
-            <datalist id="tpl-source-list">{% for s in SOURCE_CHOICES %}<option value="{{ s }}">{% endfor %}</datalist>
+            <input type="text" name="source" list="tpl-source-list" value="{{ d.source|source_label if d.source else '' }}" autocomplete="off">
+            <datalist id="tpl-source-list">{% for s in SOURCE_CHOICES %}<option value="{{ s.label }}">{% endfor %}</datalist>
         </div>
         <div class="form-group">
             <label>稿件类别</label>
-            <input type="text" name="commission_type" list="tpl-type-list" value="{{ d.commission_type or '' }}" autocomplete="off">
-            <datalist id="tpl-type-list">{% for t in COMMISSION_TYPE_CHOICES %}<option value="{{ t }}">{% endfor %}</datalist>
+            <input type="text" name="commission_type" list="tpl-type-list" value="{{ d.commission_type|commission_label if d.commission_type else '' }}" autocomplete="off">
+            <datalist id="tpl-type-list">{% for t in COMMISSION_TYPE_CHOICES %}<option value="{{ t.label }}">{% endfor %}</datalist>
         </div>
     </div>
     <div class="form-row">
@@ -57,7 +57,7 @@
         <label>阶段</label>
         <select name="current_stage" id="tpl-stage-select">
             {% for s in STAGE_CHOICES %}
-            <option value="{{ s }}" {% if s == (d.current_stage or '待开始') %}selected{% endif %}>{{ s }}</option>
+            <option value="{{ s.code }}" {% if s.code == (d.current_stage or pending_stage_code()) %}selected{% endif %}>{{ s.label }}</option>
             {% endfor %}
         </select>
     </div>
@@ -65,7 +65,7 @@
         <label>收款</label>
         <select name="payment_status">
             {% for s in PAYMENT_CHOICES %}
-            <option value="{{ s }}" {% if s == (d.payment_status or '未收款') %}selected{% endif %}>{{ s }}</option>
+            <option value="{{ s.code }}" {% if s.code == (d.payment_status or unpaid_status_code()) %}selected{% endif %}>{{ s.label }}</option>
             {% endfor %}
         </select>
     </div>
@@ -143,6 +143,8 @@
     </div>
 <script>
 var _TPL_FLOWS = {{ STAGE_FLOWS | tojson }};
+// Spec33 卡 168：流程快照里的 name 已是 code（M6/M7/M15 转码），下拉显示必须翻中文
+var STAGE_LABEL_MAP = {{ ENUM_LABELS.stage | tojson }};
 // Spec 26：模板携带分期时初始化模式提示条显示态
 (function() {
     var pmSel = document.querySelector('select[name="payment_mode"]');
@@ -175,7 +177,7 @@ function onTplFlowChange() {
             stageSelect.innerHTML = '';
             flow.stages.forEach(function(s) {
                 var opt = document.createElement('option');
-                opt.value = s.name; opt.textContent = s.name;
+                opt.value = s.name; opt.textContent = (STAGE_LABEL_MAP[s.name] || s.name);
                 if (s.name === curVal) opt.selected = true;
                 stageSelect.appendChild(opt);
             });
@@ -206,7 +208,7 @@ function onTplFlowChange() {
                     stageSelect.innerHTML = '';
                     _TPL_FLOWS[i].stages.forEach(function(s) {
                         var opt = document.createElement('option');
-                        opt.value = s.name; opt.textContent = s.name;
+                        opt.value = s.name; opt.textContent = (STAGE_LABEL_MAP[s.name] || s.name);
                         if (s.name === curVal) opt.selected = true;
                         stageSelect.appendChild(opt);
                     });

@@ -30,25 +30,25 @@
             <select name="stage">
                 <option value="">所有阶段</option>
                 {% for s in STAGE_CHOICES %}
-                <option value="{{ s }}" {% if filters.get('stage') == s %}selected{% endif %}>{{ s }}</option>
+                <option value="{{ s.code }}" {% if filters.get('stage') == s.code %}selected{% endif %}>{{ s.label }}</option>
                 {% endfor %}
             </select>
             <select name="source">
                 <option value="">所有来源</option>
                 {% for s in SOURCE_CHOICES %}
-                <option value="{{ s }}" {% if filters.get('source') == s %}selected{% endif %}>{{ s }}</option>
+                <option value="{{ s.code }}" {% if filters.get('source') == s.code %}selected{% endif %}>{{ s.label }}</option>
                 {% endfor %}
             </select>
             <select name="commission_type">
                 <option value="">所有类别</option>
                 {% for ct in COMMISSION_TYPE_CHOICES %}
-                <option value="{{ ct }}" {% if filters.get('commission_type') == ct %}selected{% endif %}>{{ ct }}</option>
+                <option value="{{ ct.code }}" {% if filters.get('commission_type') == ct.code %}selected{% endif %}>{{ ct.label }}</option>
                 {% endfor %}
             </select>
             <select name="status">
                 <option value="">所有状态</option>
                 {% for s in DDL_CHOICES %}
-                <option value="{{ s }}" {% if filters.get('status') == s %}selected{% endif %}>{{ s }}</option>
+                <option value="{{ s.code }}" {% if filters.get('status') == s.code %}selected{% endif %}>{{ s.label }}</option>
                 {% endfor %}
             </select>
             <!-- P16e：按订单结束时间范围筛选（起/止，任一端可空） -->
@@ -78,7 +78,7 @@
             <span class="batch-group-label">阶段</span>
             <div class="batch-group-btns">
                 {% for s in STAGE_CHOICES %}
-                <button class="batch-btn" data-action="stage:{{ s }}" onclick="pickBatchAction(this)">{{ s }}</button>
+                <button class="batch-btn" data-action="stage:{{ s.code }}" onclick="pickBatchAction(this)">{{ s.label }}</button>
                 {% endfor %}
             </div>
         </div>
@@ -86,7 +86,7 @@
             <span class="batch-group-label">来源</span>
             <div class="batch-group-btns">
                 {% for s in SOURCE_CHOICES %}
-                <button class="batch-btn" data-action="source:{{ s }}" onclick="pickBatchAction(this)">{{ s }}</button>
+                <button class="batch-btn" data-action="source:{{ s.code }}" onclick="pickBatchAction(this)">{{ s.label }}</button>
                 {% endfor %}
             </div>
         </div>
@@ -94,7 +94,7 @@
             <span class="batch-group-label">收款</span>
             <div class="batch-group-btns">
                 {% for s in PAYMENT_CHOICES %}
-                <button class="batch-btn" data-action="payment:{{ s }}" onclick="pickBatchAction(this)">{{ s }}</button>
+                <button class="batch-btn" data-action="payment:{{ s.code }}" onclick="pickBatchAction(this)">{{ s.label }}</button>
                 {% endfor %}
             </div>
         </div>

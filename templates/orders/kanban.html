@@ -19,7 +19,7 @@
                     {% for stage in columns.keys() %}
                     <label class="kanban-filter-item">
                         <input type="checkbox" class="kanban-filter-stage" value="{{ stage }}" checked>
-                        <span>{{ stage }}</span>
+                        <span>{{ stage|stage_label }}</span>
                     </label>
                     {% endfor %}
                 </div>
@@ -61,7 +61,7 @@
             <span class="kanban-column-title">
                 {# Spec12：通用圆点着色，自定义阶段无 emoji 时回退 #}
                 <span class="kanban-stage-dot" style="background:var(--stage-{{ stage|stage_class }}, var(--color-text-tertiary));"></span>
-                {{ stage }}
+                {{ stage|stage_label }}
             </span>
             <div>
                 <span class="kanban-column-count">{{ orders|length }}</span>

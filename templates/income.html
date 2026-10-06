@@ -293,15 +293,17 @@ function updateParam(key, value) {
     // P20a：取色逻辑（8 色循环 + 透明度变体）已迁移至 app.js seriesColors
     var COMMISSION_COLORS = {{ commission_colors|tojson }};
     var SOURCE_COLORS = {{ source_colors|tojson }};
+    // Spec35 D2：显示用 label，配色查找用 code（COMMISSION_COLORS 的键是 cmt_*），两者必须分开取
+    var TYPE_CODES = {{ type_distribution|map(attribute='commission_type')|list|tojson }};
     var typeChart = new Chart(document.getElementById('type-chart').getContext('2d'), {
         type: 'doughnut',
         data: {
-            labels: {{ type_distribution|map(attribute='commission_type')|list|tojson }},
+            labels: {{ type_distribution|map(attribute='label')|list|tojson }},
             datasets: [{
                 data: {{ type_distribution|map(attribute='cnt')|list|tojson }},
                 gross: {{ type_distribution|map(attribute='gross')|list|tojson }},
                 net: {{ type_distribution|map(attribute='net')|list|tojson }},
-                backgroundColor: seriesColors({{ type_distribution|map(attribute='commission_type')|list|tojson }}, COMMISSION_COLORS),
+                backgroundColor: seriesColors(TYPE_CODES, COMMISSION_COLORS),
                 borderWidth: 2, borderColor: '#fff',
             }]
         },
@@ -325,11 +327,12 @@ function updateParam(key, value) {
         var url = '/api/income/type-distribution?year=' + selectedYear;
         if (month) url += '&month=' + month;
         fetch(url).then(function(r) { return r.json(); }).then(function(data) {
-            typeChart.data.labels = data.map(function(d) { return d.commission_type; });
+            typeChart.data.labels = data.map(function(d) { return d.label; });
+            TYPE_CODES = data.map(function(d) { return d.commission_type; });
             typeChart.data.datasets[0].data = data.map(function(d) { return d.cnt; });
             typeChart.data.datasets[0].gross = data.map(function(d) { return d.gross; });
             typeChart.data.datasets[0].net = data.map(function(d) { return d.net; });
-            typeChart.data.datasets[0].backgroundColor = seriesColors(typeChart.data.labels, COMMISSION_COLORS);  // #43：按品类配置取色，类别集变化时同步重建
+            typeChart.data.datasets[0].backgroundColor = seriesColors(TYPE_CODES, COMMISSION_COLORS);  // #43：按品类配置取色，类别集变化时同步重建（Spec35 D2：键为 code）
             typeChart.update();
         });
     });
@@ -401,7 +404,7 @@ function updateParam(key, value) {
             labels: hourlyByType.map(function(d) { return d.name; }),
             datasets: [{
                 data: hourlyByType.map(function(d) { return d.rate; }),
-                backgroundColor: seriesColors(hourlyByType.map(function(d) { return d.name; }), COMMISSION_COLORS),
+                backgroundColor: seriesColors(hourlyByType.map(function(d) { return d.code; }), COMMISSION_COLORS),
                 borderRadius: 4,
             }]
         },
@@ -418,7 +421,7 @@ function updateParam(key, value) {
             labels: hourlyBySource.map(function(d) { return d.name; }),
             datasets: [{
                 data: hourlyBySource.map(function(d) { return d.rate; }),
-                backgroundColor: seriesColors(hourlyBySource.map(function(d) { return d.name; }), SOURCE_COLORS),
+                backgroundColor: seriesColors(hourlyBySource.map(function(d) { return d.code; }), SOURCE_COLORS),
                 borderRadius: 4,
             }]
         },
@@ -439,7 +442,7 @@ function updateParam(key, value) {
             curTypeData = data;
             hourlyTypeChart.data.labels = data.map(function(d) { return d.name; });
             hourlyTypeChart.data.datasets[0].data = data.map(function(d) { return d.rate; });
-            hourlyTypeChart.data.datasets[0].backgroundColor = seriesColors(hourlyTypeChart.data.labels, COMMISSION_COLORS);
+            hourlyTypeChart.data.datasets[0].backgroundColor = seriesColors(data.map(function(d) { return d.code; }), COMMISSION_COLORS);
             hourlyTypeChart.update();
         });
     });

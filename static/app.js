@@ -308,6 +308,9 @@ function runPageInit() {
     initImageUpload();                        // 幂等（zone.dataset.bound 守卫），无上传区页面直接 return
     var path = window.location.pathname;
     if (path === '/income' && typeof initIncomeLayout === 'function') initIncomeLayout();
+    // 设置页备份列表：app.js 移入 head 后顶层执行时 DOM 未就绪（恒「加载中…」），
+    // 改挂统一初始化入口，整页加载与 boosted 导航双路径覆盖
+    if (document.getElementById('backup-list')) loadBackupList();
     if (typeof initModuleCustomizer === 'function') initModuleCustomizer(path);
     // 快捷键缓存重置：设置页保存后（boosted 导航重渲染 __SHORTCUTS）下次按键重建
     if (window.__resetShortcutMaps) window.__resetShortcutMaps();
@@ -1417,15 +1420,28 @@ function loadBackupList() {
                 container.innerHTML = '<div style="color:var(--color-text-tertiary);padding:var(--space-sm);">暂无备份，请手动创建</div>';
                 return;
             }
-            var html = '';
+            var html = '<div style="font-size:0.72rem;color:var(--color-text-tertiary);padding:0 2px 4px;">备份时间</div>';
             for (var i = 0; i < backups.length; i++) {
                 var b = backups[i];
+                var unreadable = b.readable === false;
+                var timeLine = escHtml(b.time || b.mtime);
+                if (b.time_source === 'mtime') {
+                    timeLine += ' <span style="font-size:0.72rem;font-weight:normal;color:var(--color-text-tertiary);">（按文件时间）</span>';
+                }
                 html += '<div style="display:flex;align-items:center;gap:var(--space-sm);padding:8px 12px;background:var(--color-bg);border-radius:var(--radius-sm);margin-bottom:4px;">';
                 html += '<div style="flex:1;min-width:0;">';
-                html += '<div style="font-weight:500;">' + escHtml(b.mtime) + '</div>';
-                html += '<div style="font-size:0.75rem;color:var(--color-text-tertiary);">' + escHtml(b.size) + ' KB · ' + escHtml(b.orders) + ' 订单 · ' + escHtml(b.customers) + ' 客户</div>';
+                html += '<div style="font-weight:500;">' + timeLine + '</div>';
+                if (unreadable) {
+                    html += '<div style="font-size:0.75rem;color:var(--color-warning);">' + b.size + ' KB · 无法读取该备份</div>';
+                } else {
+                    html += '<div style="font-size:0.75rem;color:var(--color-text-tertiary);">' + b.size + ' KB · ' + b.orders + ' 订单 · ' + b.customers + ' 客户</div>';
+                }
                 html += '</div>';
-                html += '<button class="btn btn-ghost btn-sm" style="font-size:0.78rem;" onclick="restoreBackup(\'' + escHtml(b.name) + '\')">恢复</button>';
+                if (unreadable) {
+                    html += '<button class="btn btn-ghost btn-sm" style="font-size:0.78rem;opacity:0.5;cursor:not-allowed;" disabled title="该备份文件已损坏，无法恢复">恢复</button>';
+                } else {
+                    html += '<button class="btn btn-ghost btn-sm" style="font-size:0.78rem;" onclick="restoreBackup(\'' + escHtml(b.name) + '\')">恢复</button>';
+                }
                 html += '<button class="btn btn-ghost btn-sm" style="color:var(--color-danger);font-size:0.78rem;" onclick="deleteBackup(\'' + escHtml(b.name) + '\')">删除</button>';
                 html += '</div>';
             }
@@ -1498,8 +1514,6 @@ function deleteBackup(filename) {
         })
         .catch(function() { showToast('网络错误', 'error'); });
 }
-
-loadBackupList();
 
 // ── 重启相关 ──
 function openAppFolder() {
