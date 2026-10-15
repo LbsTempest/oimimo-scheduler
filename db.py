@@ -527,6 +527,44 @@ def init_db():
             value TEXT NOT NULL
         );
 
+        -- 米画师集成：外部 ID 是唯一幂等键；删除本地订单时保留映射墓碑，
+        -- 后续同步将转为人工冲突，避免静默重建已由用户删除的订单。
+        CREATE TABLE IF NOT EXISTS external_order_links (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            platform            TEXT NOT NULL,
+            external_order_id   TEXT NOT NULL,
+            local_order_id      INTEGER,
+            last_source_hash    TEXT,
+            project_name_hash   TEXT,
+            platform_url_hash   TEXT,
+            page_deadline       TEXT,
+            quoted_amount       TEXT,
+            platform_status     TEXT,
+            last_seen_at        TEXT,
+            created_at          TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            updated_at          TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            UNIQUE(platform, external_order_id),
+            UNIQUE(platform, local_order_id),
+            FOREIGN KEY(local_order_id) REFERENCES orders(id) ON DELETE SET NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_external_order_links_local
+            ON external_order_links(local_order_id);
+
+        CREATE TABLE IF NOT EXISTS mihuashi_sync_runs (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id          TEXT NOT NULL UNIQUE,
+            kind            TEXT NOT NULL,
+            status          TEXT NOT NULL,
+            summary_json    TEXT NOT NULL DEFAULT '{}',
+            error_code      TEXT,
+            duration_ms     INTEGER,
+            created_at      TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            started_at      TEXT,
+            completed_at    TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_mihuashi_sync_runs_created
+            ON mihuashi_sync_runs(created_at DESC);
+
         -- 订单模板表（P18-F3：可复用字段快照，不污染 orders 表）
         CREATE TABLE IF NOT EXISTS order_templates (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -610,6 +648,11 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_payments_order   ON order_payments(order_id);
         CREATE INDEX IF NOT EXISTS idx_payments_paid_at ON order_payments(paid_at);
     """)
+
+    try:
+        conn.execute('ALTER TABLE mihuashi_sync_runs ADD COLUMN duration_ms INTEGER')
+    except Exception:
+        pass  # 列已存在
 
     # Spec 24 小票计算模型重设计：receipt_items 补齐单品倍率/折扣列（新建库已在建表时定义，此处幂等）
     for col, decl in (
@@ -3358,10 +3401,11 @@ def _calc_financials(data: dict) -> dict:
 
 
 
-def create_order(data: dict) -> int:
+def create_order(data: dict, conn=None) -> int:
     """创建订单，返回新 ID（P19-F5：财务→DDL/归档→插入→客户重算 单事务；
-    P19-F8 起复购改查询时计算，不再写入落库）。"""
-    with transaction() as conn:
+    P19-F8 起复购改查询时计算，不再写入落库。传入 conn 时加入调用方事务。"""
+    own = conn is None
+    with (transaction() if own else nullcontext(conn)) as conn:
         data = _calc_financials(data)
         # 自动计算 DDL 状态 + 自动归档
         data = _auto_calc_ddl_status(data)
