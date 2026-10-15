@@ -3,3 +3,4 @@ pydantic>=2.0
 flask-cors
 Pillow>=10.0
 pystray>=0.19
+playwright>=1.40
