@@ -11,17 +11,18 @@
 - **后端**：Python 3.9+ / Flask 3 / Pydantic v2（校验）/ sqlite3 标准库（无 ORM）
 - **前端**：Jinja2 模板 + HTMX 2 局部刷新。**没有前端构建步骤**，没有 Node/npm，所有第三方 JS 在 `static/vendor/` 本地化（离线可用），不要引入 CDN 链接
 - **数据库**：SQLite 单文件 `orders.db`（WAL 模式），随首次运行自动创建
-- **保持本地优先**：不要加入任何联网上报、账号、SaaS 化功能
+- **保持本地优先**：不要加入联网上报、账号体系或 SaaS 化功能。唯一经用户明确要求的外部连接是 `integrations/mihuashi/`：Playwright 使用本人本机 Profile 只读访问本人可见的米画师页面，不保存凭证、不写回平台、不上传 oimimo 数据。
 
 ## 文件-职责对照表
 
 | 路径 | 职责 |
 |---|---|
-| `app.py` | 路由层（33 个 `@app.route`）：页面渲染 + HTMX partial + JSON API，全部业务入口 |
+| `app.py` | 路由层：页面渲染 + HTMX partial + JSON API，全部业务入口 |
 | `db.py` | 数据层：schema 建表/迁移、全部 SQL 读写函数、统计口径计算 |
 | `models.py` | Pydantic 模型：订单/客户表单校验与类型转换 |
 | `image_processor.py` | 图片处理：上传图压缩、预览图/缩略图生成（Pillow） |
 | `launcher.py` | 桌面启动器：依赖自检安装 → 起 Flask 线程 → 开浏览器 → pystray 托盘图标；已适配 PyInstaller（`sys.frozen` / `_MEIPASS` / `resource_path()`） |
+| `integrations/mihuashi/` | 本机 Playwright 会话、订单适配、标准模型、幂等同步和串行任务生命周期 |
 | `templates/base.html` | 全局布局：侧边栏导航、主题 CSS 变量注入、模态容器 |
 | `templates/index.html` | 主页仪表盘（统计卡/甘特图/本周排单） |
 | `templates/calendar.html` | 日历视图（FullCalendar 初始化与拖拽逻辑） |
@@ -53,13 +54,16 @@
 3. **统计口径**：收入统计区分毛/净、平台/直接两种财务模式，口径集中在 `db.py`，不要在模板里重新计算
 4. **schema 迁移**：改表结构时在 `db.py` 的 init/migrate 逻辑中用 `ALTER TABLE` 增量迁移，保证老用户 `orders.db` 直接升级不丢数据
 5. **运行时产物不入库**：`orders.db`、`uploads/`、`exports/`、`logs/`、`__pycache__/` 均已在 `.gitignore`，不要提交
+6. 米画师 Profile、Chromium 运行时和虚拟环境分别位于项目内 `.runtime/`、`.playwright-browsers/`、`.venv/`，均须保持 Git 忽略；不要将登录状态或原始订单响应写入文档、日志或 fixtures。
 
 ## 本地运行与验证
 
 ```bash
-pip install -r requirements.txt
-python launcher.py    # 推荐：启动器（自动开浏览器 + 托盘）
-python app.py         # 或：纯 Flask 调试模式
+uv venv .venv
+UV_CACHE_DIR="$PWD/.uv-cache" uv pip install --python .venv/bin/python -r requirements.txt
+PLAYWRIGHT_BROWSERS_PATH="$PWD/.playwright-browsers" UV_CACHE_DIR="$PWD/.uv-cache" uv run --no-project --python .venv/bin/python playwright install chromium
+.venv/bin/python launcher.py  # 推荐：启动器（自动开浏览器 + 托盘）
+.venv/bin/python app.py       # 或：纯 Flask 调试模式
 ```
 
 验证清单（改完代码至少跑一遍）：

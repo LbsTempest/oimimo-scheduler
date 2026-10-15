@@ -14,6 +14,10 @@ __pycache__/
 *.pyo
 .venv/
 venv/
+.playwright-browsers/
+.runtime/
+.uv-cache/
+.pyinstaller-cache/
 
 # --- 打包产物 ---
 build/

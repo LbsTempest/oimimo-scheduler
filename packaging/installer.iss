@@ -42,7 +42,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 [Files]
 ; package PyInstaller output; exclude runtime files created during local testing
 ; so the installer never ships a database and never overwrites user data on upgrade
-Source: "{#DistDir}\*"; DestDir: "{app}"; Excludes: "orders.db,*.db,*.db.bak_*,logs\*"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#DistDir}\*"; DestDir: "{app}"; Excludes: "orders.db,*.db,*.db.bak_*,logs\*,.runtime\*"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{userprograms}\{#MyAppDisplayName}"; Filename: "{app}\{#MyAppExeName}"

@@ -13,8 +13,43 @@ REM ============================================================
 set "ROOT=%~dp0.."
 cd /d "%ROOT%"
 
+where uv >nul 2>nul
+if errorlevel 1 (
+    echo [错误] 未找到 uv。请先安装 uv，再运行此构建脚本。
+    pause
+    exit /b 1
+)
+
+set "UV_CACHE_DIR=%ROOT%\.uv-cache"
+if not exist ".runtime\tmp" mkdir ".runtime\tmp"
+set "TEMP=%ROOT%\.runtime\tmp"
+set "TMP=%ROOT%\.runtime\tmp"
+if not exist ".venv\Scripts\python.exe" uv venv .venv
+if errorlevel 1 (
+    echo [错误] 创建项目虚拟环境失败
+    pause
+    exit /b 1
+)
+set "PROJECT_PYTHON=%ROOT%\.venv\Scripts\python.exe"
+set "PYINSTALLER_CONFIG_DIR=%ROOT%\.pyinstaller-cache"
+uv pip install --python "%PROJECT_PYTHON%" -r requirements.txt pyinstaller
+if errorlevel 1 (
+    echo [错误] 使用 uv 安装构建依赖失败
+    pause
+    exit /b 1
+)
+
+echo [0/3] 安装当前平台的 Chromium 运行时到项目目录...
+set "PLAYWRIGHT_BROWSERS_PATH=%ROOT%\.playwright-browsers"
+"%PROJECT_PYTHON%" -m playwright install chromium
+if errorlevel 1 (
+    echo [错误] Playwright Chromium 安装失败；请检查依赖和网络后重试
+    pause
+    exit /b 1
+)
+
 echo [1/3] PyInstaller 打包（清空重建 dist\oimimo）...
-python -m PyInstaller --noconfirm --clean oimimo.spec
+"%PROJECT_PYTHON%" -m PyInstaller --noconfirm --clean oimimo.spec
 if errorlevel 1 (
     echo [错误] PyInstaller 打包失败
     pause

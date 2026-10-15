@@ -10,7 +10,7 @@
 
 </div>
 
-数据全部保存在本地 SQLite 单文件中，无需联网、无账号注册、不上传任何数据。
+业务数据保存在本地 SQLite 单文件中，无账号注册、不上传任何数据。米画师同步是可选功能：仅在用户主动连接并启用后，由本机 Playwright 访问本人可见的订单页面。
 
 > **[使用说明书](docs/USER_GUIDE.md)** — 完整功能使用指南，覆盖每个页面的详细操作说明
 
@@ -20,6 +20,7 @@
 
 - **主页仪表盘**：统计卡 5 指标（进行中 / 本月收入含环比 / 逾期 / 已完成 / 待收金额）、SVG 甘特图排期（日/周/月/年视图，拖拽改期）、本周排单表、逾期提醒
 - **日历视图**：月/周视图，未排期池拖拽入历，事件拖拽移动/调时长自动保存，5 种着色模式（来源/阶段/DDL/收款/类别），**日历订阅**（iOS/Android 局域网 ICS 同步）
+- **米画师订单同步（集成开发中）**：通过本机持久化浏览器手动登录；完成账号页面勘察前，同步保持禁用
 - **排单列表**：12 列分页表，阶段/来源/DDL/类别/关键词多维筛选，批量操作，归档管理，Markdown 导出
 - **看板**：阶段列拖拽流转，快捷推进按钮，阶段时间轴，列统计
 
@@ -87,14 +88,28 @@
 
 ## 从源码运行
 
-需要 Python 3.9+：
+需要 Python 3.9+ 和 uv。以下命令适用于 Linux/macOS，虚拟环境、uv 缓存和 Chromium 均保存在仓库目录：
 
 ```bash
-pip install -r requirements.txt
-python launcher.py        # 启动器模式（推荐，含托盘图标）
+uv venv .venv
+UV_CACHE_DIR="$PWD/.uv-cache" uv pip install --python .venv/bin/python -r requirements.txt
+PLAYWRIGHT_BROWSERS_PATH="$PWD/.playwright-browsers" UV_CACHE_DIR="$PWD/.uv-cache" uv run --no-project --python .venv/bin/python playwright install chromium
+.venv/bin/python launcher.py  # 启动器模式（推荐，含托盘图标）
 # 或
-python app.py             # 直接运行 Flask（调试用）
+.venv/bin/python app.py       # 直接运行 Flask（调试用）
 ```
+
+oimimo 内的连接窗口和后台同步使用项目内 Chromium。开发用 `integrations.mihuashi.cli_inspect` 默认使用系统 Google Chrome 和项目内独立 Profile；也可用 `--browser chromium` 切换到项目内 Chromium。
+
+Windows 源码开发时，在仓库目录的 PowerShell 中运行：
+
+```powershell
+$env:UV_CACHE_DIR = "$PWD\.uv-cache"
+uv venv .venv
+uv pip install --python .venv\Scripts\python.exe -r requirements.txt
+```
+
+`packaging/build.bat` 会复用此项目虚拟环境，用 uv 安装 PyInstaller 和运行依赖，并将下载缓存、临时文件、Chromium 和打包缓存留在仓库内。
 
 ## 技术栈
 
@@ -113,6 +128,8 @@ python app.py             # 直接运行 Flask（调试用）
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — 架构：路由全表、DB schema、核心机制
 - [docs/DESIGN.md](docs/DESIGN.md) — 设计系统：Design Tokens、主题、组件规范
 - [docs/PROJECT.md](docs/PROJECT.md) — 项目说明书：功能矩阵、业务口径
+- [docs/operations.md](docs/operations.md) — 米画师集成开发与运行说明
+- [docs/investigation.md](docs/investigation.md) — 米画师本人账号网页勘察记录
 - [CHANGELOG.md](CHANGELOG.md) — 版本更新记录
 
 ## 许可证
