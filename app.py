@@ -32,6 +32,7 @@ from image_processor import (
     process_uploaded_file, process_uploaded_file_multi, save_without_pillow,
     process_tool_image, ALLOWED_EXTS, MAX_UPLOAD_SIZE,
 )
+from integrations.mihuashi.web_security import is_local_request as _is_local_integration_request
 
 logger = logging.getLogger(__name__)
 # 动态选择列表从 db.get_choices() 读取（替代硬编码常量）
@@ -3995,6 +3996,90 @@ def api_import_mihuashi():
 
 
 # ═══════════════════════════════════════════════════════════
+# 米画师集成管理 API（本地同源、任务在串行后台线程执行）
+# ═══════════════════════════════════════════════════════════
+
+@app.get('/api/integrations/mihuashi/status')
+def mihuashi_integration_status():
+    if not _is_local_integration_request(request):
+        return jsonify({'success': False, 'error': '仅允许本机访问'}), 403
+    from integrations.mihuashi.sync_manager import get_manager
+    return jsonify({'success': True, **get_manager().status()})
+
+
+@app.get('/api/integrations/mihuashi/settings')
+def mihuashi_integration_settings():
+    if not _is_local_integration_request(request):
+        return jsonify({'success': False, 'error': '仅允许本机访问'}), 403
+    from integrations.mihuashi.status_store import get_settings
+    return jsonify({'success': True, 'settings': get_settings()})
+
+
+@app.put('/api/integrations/mihuashi/settings')
+def update_mihuashi_integration_settings():
+    if not _is_local_integration_request(request, require_origin=True):
+        return jsonify({'success': False, 'error': '本机来源校验失败'}), 403
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict) or not data:
+        return jsonify({'success': False, 'error': '请提交设置对象'}), 400
+    allowed = {'auto_sync_enabled', 'sync_on_startup', 'interval_minutes',
+               'max_pages_per_run', 'headless_for_sync', 'allow_automatic_create'}
+    if set(data) - allowed:
+        return jsonify({'success': False, 'error': '包含未知设置项'}), 400
+
+    from integrations.mihuashi import collector
+    if not collector.COLLECTOR_READY:
+        for key in ('auto_sync_enabled', 'allow_automatic_create'):
+            value = data.get(key, False)
+            enabled = value is True or value in ('1', 1)
+            if enabled:
+                return jsonify({'success': False, 'error': '本人账号页面适配完成前，自动同步和自动新增保持关闭'}), 409
+
+    clean = {}
+    flag_names = allowed - {'interval_minutes', 'max_pages_per_run'}
+    for key in flag_names & set(data):
+        value = data[key]
+        if isinstance(value, bool):
+            clean[key] = '1' if value else '0'
+        elif value in ('0', '1', 0, 1):
+            clean[key] = str(int(value))
+        else:
+            return jsonify({'success': False, 'error': '{} 必须是布尔值'.format(key)}), 400
+    for key, low, high in (('interval_minutes', 15, 1440), ('max_pages_per_run', 1, 20)):
+        if key not in data:
+            continue
+        try:
+            value = int(data[key])
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': '{} 必须是整数'.format(key)}), 400
+        if not low <= value <= high:
+            return jsonify({'success': False, 'error': '{} 范围为 {}–{}'.format(key, low, high)}), 400
+        clean[key] = str(value)
+
+    from integrations.mihuashi.status_store import get_settings, update_settings
+    update_settings(clean)
+    return jsonify({'success': True, 'settings': get_settings()})
+
+
+@app.post('/api/integrations/mihuashi/sync')
+def trigger_mihuashi_sync():
+    if not _is_local_integration_request(request, require_origin=True):
+        return jsonify({'success': False, 'error': '本机来源校验失败'}), 403
+    from integrations.mihuashi.sync_manager import get_manager
+    task = get_manager().submit('sync')
+    return jsonify({'success': True, **task}), 202
+
+
+@app.post('/api/integrations/mihuashi/login')
+def start_mihuashi_login():
+    if not _is_local_integration_request(request, require_origin=True):
+        return jsonify({'success': False, 'error': '本机来源校验失败'}), 403
+    from integrations.mihuashi.sync_manager import get_manager
+    task = get_manager().submit('login')
+    return jsonify({'success': True, **task}), 202
+
+
+# ═══════════════════════════════════════════════════════════
 # 日历订阅 ICS feed（Spec20：卡 84 生成 + 端点；卡 85 第二监听 + 端口守卫；设置卡片属卡 86）
 # ═══════════════════════════════════════════════════════════
 
@@ -4466,4 +4551,9 @@ if __name__ == '__main__':
     _DEBUG = True
     if not _DEBUG or os.environ.get('WERKZEUG_RUN_MAIN') == 'true':
         start_feed_server()
+        try:
+            from integrations.mihuashi.sync_manager import start_manager
+            start_manager()
+        except Exception:
+            logger.exception('米画师同步管理器启动失败（不影响排单服务）')
     app.run(debug=_DEBUG, host='127.0.0.1', port=port)

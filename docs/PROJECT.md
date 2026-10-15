@@ -10,7 +10,7 @@
 接单 → 排期 → 跟进 → 收款 → 统计 → 归档
 ```
 
-**核心原则**：本地优先（SQLite 单文件、零网络依赖）· 桌面集成（启动器+浏览器，类原生体验）· 动态可配置（注册表/主题/选择列表免改代码）· HTMX 无刷新 · 不 SaaS 化。
+**核心原则**：本地优先（SQLite 单文件，不上传数据）· 桌面集成（启动器+浏览器，类原生体验）· 动态可配置（注册表/主题/选择列表免改代码）· HTMX 无刷新 · 不 SaaS 化。米画师集成是用户主动开启的本地 Playwright 只读连接。
 
 ---
 
@@ -22,6 +22,8 @@
 | [DESIGN.md](DESIGN.md) | 设计系统：Design Tokens、主题/着色、组件与视图规范 |
 | [CHANGELOG.md](CHANGELOG.md) | 版本迭代记录 |
 | [AGENTS.md](../../AGENTS.md) | 给 AI/开发者的项目地图（仓库根） |
+| [operations.md](operations.md) | 米画师集成操作、当前状态和打包方式 |
+| [field_mapping.md](field_mapping.md) | 外部字段与本地字段权责 |
 
 ---
 
@@ -34,7 +36,7 @@
 | 批处理 | `run.bat` | 1096 |
 | 打包 exe | `pyinstaller build.spec`（推荐走 `build.bat` 一键构建：自动建/复用 `.venv-build` 干净环境 + 锁定依赖版本 + 体积留痕） | 1096 |
 
-依赖：`pip install -r requirements.txt`（flask≥3.0 / pydantic≥2.0 / flask-cors / Pillow≥10.0 / pystray≥0.19）。启动器会自动补装缺失依赖。数据文件生成在 exe 同级目录。
+依赖：`pip install -r requirements.txt`（Flask / Pydantic / Pillow / pystray / Playwright）。启动器会自动补装缺失 Python 依赖；Chromium 浏览器由打包流程随应用分发。订单数据文件生成在 exe 同级目录。
 
 ---
 

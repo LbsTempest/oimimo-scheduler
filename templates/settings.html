@@ -393,6 +393,28 @@
 
 <!-- ═══════════ Tab: 系统 ═══════════ -->
 <div id="panel-system" style="display:none;">
+    <div class="card" id="mihuashi-integration-card" style="margin-bottom:var(--space-md);">
+        <div class="card-header">米画师订单同步</div>
+        <div class="card-body" style="display:flex;flex-direction:column;gap:var(--space-sm);">
+            <div id="mihuashi-status" role="status" style="font-size:0.86rem;color:var(--color-text-secondary);">正在读取同步状态…</div>
+            <div style="display:flex;gap:var(--space-sm);flex-wrap:wrap;">
+                <button type="button" class="btn btn-secondary btn-sm" id="mihuashi-login-btn" onclick="mihuashiStartLogin()">连接 / 重新登录</button>
+                <button type="button" class="btn btn-primary btn-sm" id="mihuashi-sync-btn" onclick="mihuashiStartSync()" disabled>立即同步</button>
+            </div>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px;font-size:0.84rem;">
+                <label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" id="mihuashi-auto-sync" disabled> 启用自动同步</label>
+                <label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" id="mihuashi-on-startup"> 启动时同步</label>
+                <label style="display:flex;align-items:center;gap:8px;">间隔（分钟）<input type="number" id="mihuashi-interval" min="15" max="1440" step="1" value="20" style="width:84px;"></label>
+                <label style="display:flex;align-items:center;gap:8px;">每次最多翻页<input type="number" id="mihuashi-max-pages" min="1" max="20" step="1" value="20" style="width:72px;"></label>
+                <label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" id="mihuashi-headless" checked> 后台同步使用无头浏览器</label>
+                <label style="display:flex;align-items:center;gap:8px;"><input type="checkbox" id="mihuashi-auto-create"> 允许自动新增本地订单</label>
+            </div>
+            <div style="font-size:0.76rem;color:var(--color-text-tertiary);">自动同步和订单导入会在本人账号页面勘察、字段映射与幂等验证完成后开放。平台报价不会记作已收款；本地排期、绘制阶段、收款和笔记由你管理。</div>
+            <div style="display:flex;justify-content:flex-end;">
+                <button type="button" class="btn btn-secondary btn-sm" onclick="mihuashiSaveSettings()">保存同步设置</button>
+            </div>
+        </div>
+    </div>
     {% if data_recovery_needed %}
     <div class="card" style="margin-bottom:var(--space-md);border:1px solid var(--color-danger);">
         <div class="card-header" style="color:var(--color-danger);">⚠ 数据恢复建议</div>
@@ -1687,6 +1709,93 @@ window.__pageInit = function() {
     initCommissionMerge();
     initSourceMerge();
     initStageFlows();
+    mihuashiLoadStatus();
 };
+
+function mihuashiLoadStatus() {
+    fetch('/api/integrations/mihuashi/status')
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+            if (!data.success) throw new Error(data.error || '读取失败');
+            var s = data.settings || {};
+            document.getElementById('mihuashi-status').textContent = data.message || '就绪';
+            document.getElementById('mihuashi-sync-btn').disabled = !data.collector_ready;
+            document.getElementById('mihuashi-auto-sync').disabled = !data.collector_ready;
+            document.getElementById('mihuashi-auto-create').disabled = !data.collector_ready;
+            document.getElementById('mihuashi-auto-sync').checked = data.collector_ready && s.auto_sync_enabled === '1';
+            document.getElementById('mihuashi-on-startup').checked = s.sync_on_startup === '1';
+            document.getElementById('mihuashi-interval').value = s.interval_minutes || '20';
+            document.getElementById('mihuashi-max-pages').value = s.max_pages_per_run || '20';
+            document.getElementById('mihuashi-headless').checked = s.headless_for_sync !== '0';
+            document.getElementById('mihuashi-auto-create').checked = data.collector_ready && s.allow_automatic_create === '1';
+            var last = data.last_run;
+            if (last) {
+                var tail = '最近任务：' + last.kind + ' / ' + last.status;
+                var errors = {
+                    adapter_not_configured: '订单采集器等待账号页面实测',
+                    browser_runtime_missing: '缺少 Chromium 浏览器运行时',
+                    profile_locked: '浏览器 Profile 正在由另一任务使用',
+                    login_required: '需要本人重新登录，自动同步已暂停',
+                    platform_blocked: '平台拒绝或限制访问，同步已暂停',
+                    transient_error: '临时网络错误，稍后按退避时间重试',
+                    retry_backoff: '仍在错误退避窗口内，暂不重复请求',
+                    integration_error: '集成任务失败，请检查本机日志',
+                    shutdown: '程序退出时取消了任务'
+                };
+                if (last.error_code) tail += '（' + (errors[last.error_code] || '任务错误') + '）';
+                if (last.completed_at) tail += ' · ' + last.completed_at;
+                if (last.kind === 'sync' && last.summary && typeof last.summary.created !== 'undefined') {
+                    tail += ' · 新增 ' + last.summary.created + ' / 更新 ' + last.summary.updated
+                        + ' / 无变化 ' + last.summary.unchanged + ' / 冲突 ' + last.summary.conflicts
+                        + ' / 跳过 ' + last.summary.skipped + ' / 失败 ' + last.summary.failed;
+                }
+                document.getElementById('mihuashi-status').textContent += ' · ' + tail;
+            }
+            if (data.active_task_id || (last && ['queued', 'running'].indexOf(last.status) >= 0)) {
+                window.setTimeout(mihuashiLoadStatus, 2500);
+            }
+        })
+        .catch(function(err) {
+            document.getElementById('mihuashi-status').textContent = '无法读取同步状态：' + err.message;
+        });
+}
+
+function mihuashiSaveSettings() {
+    var body = {
+        auto_sync_enabled: document.getElementById('mihuashi-auto-sync').checked,
+        sync_on_startup: document.getElementById('mihuashi-on-startup').checked,
+        interval_minutes: Number(document.getElementById('mihuashi-interval').value),
+        max_pages_per_run: Number(document.getElementById('mihuashi-max-pages').value),
+        headless_for_sync: document.getElementById('mihuashi-headless').checked,
+        allow_automatic_create: document.getElementById('mihuashi-auto-create').checked
+    };
+    fetch('/api/integrations/mihuashi/settings', {
+        method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
+    }).then(function(r) { return r.json().then(function(d) { if (!r.ok) throw new Error(d.error || '保存失败'); return d; }); })
+      .then(function() { showToast('米画师同步设置已保存', 'success'); mihuashiLoadStatus(); })
+      .catch(function(err) { showToast('保存失败：' + err.message, 'error'); });
+}
+
+function mihuashiStartLogin() {
+    fetch('/api/integrations/mihuashi/login', {method: 'POST'})
+        .then(function(r) { return r.json().then(function(d) { if (!r.ok) throw new Error(d.error || '无法启动登录窗口'); return d; }); })
+        .then(function() { showToast('登录窗口已启动，请手动完成登录', 'info'); mihuashiLoadStatus(); })
+        .catch(function(err) { showToast(err.message, 'error'); });
+}
+
+function mihuashiStartSync() {
+    fetch('/api/integrations/mihuashi/sync', {method: 'POST'})
+        .then(function(r) { return r.json().then(function(d) { if (!r.ok) throw new Error(d.error || '无法排队同步'); return d; }); })
+        .then(function(data) {
+            if (data.blocked) {
+                showToast(data.blocked === 'login_required' ? '请先重新连接账号' : '任务暂停：' + data.blocked, 'error');
+                mihuashiLoadStatus();
+                return;
+            }
+            showToast(data.queued ? '同步任务已排队' : '已有同步任务正在运行', 'info');
+            mihuashiLoadStatus();
+        })
+        .catch(function(err) { showToast(err.message, 'error'); });
+}
 </script>
 {% endblock %}

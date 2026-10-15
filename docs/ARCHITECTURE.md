@@ -160,6 +160,10 @@ main()
 | `/api/income/hourly-type-distribution` | JSON | 时薪品类分布 |
 | `/api/quote-suggestion` | HTML | 报价建议条 |
 | `/api/v1/health` | JSON | 健康检查 `{status, version}` |
+| `/api/integrations/mihuashi/status` | JSON | 本机同步状态；仅返回任务元数据 |
+| `/api/integrations/mihuashi/settings` | JSON / JSON | 读取 / 更新同步配置；写入校验本机 Host 与同源 Origin |
+| `/api/integrations/mihuashi/sync` | JSON | 后台串行排队一次同步任务，立即返回 task ID |
+| `/api/integrations/mihuashi/login` | JSON | 后台打开用户可见的持久化 Chromium 登录窗口 |
 
 ### 4.3 订单操作（POST）
 
@@ -202,6 +206,10 @@ main()
 **customers（10 列）**：id · name UNIQUE · platform_url · preferences · notes · tags · total_spent · purchase_count · created_at · updated_at
 
 **settings（86 键）**：key PK, value — 详见 §9
+
+**external_order_links**：platform · external_order_id · local_order_id（本地订单删除时置 NULL，作为禁止自动重建的墓碑）· source/本地字段 hash · page_deadline · quoted_amount · platform_status · last_seen_at；UNIQUE(platform, external_order_id) + UNIQUE(platform, local_order_id)
+
+**mihuashi_sync_runs**：run_id · kind · status · summary_json（仅计数/任务结果）· error_code · duration_ms · created_at · started_at · completed_at
 
 **order_images（6 列）**：id · order_id · image_url · image_path · sort_order · created_at
 

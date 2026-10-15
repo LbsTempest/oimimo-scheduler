@@ -24,11 +24,31 @@ def check_python():
 
 def install_deps():
     try:
-        import flask, pydantic, flask_cors
-    except ImportError:
-        print("安装依赖...")
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-r",
-            os.path.join(ROOT, "requirements.txt"), "-q"])
+        import flask, pydantic, flask_cors, playwright
+    except ImportError as exc:
+        if sys.prefix == sys.base_prefix:
+            print("缺少运行依赖。请在项目目录创建并使用 .venv；启动器不会向系统 Python 安装包。")
+            print("Linux/macOS: uv venv .venv && UV_CACHE_DIR=\"$PWD/.uv-cache\" uv pip install --python .venv/bin/python -r requirements.txt")
+            print("Windows PowerShell: $env:UV_CACHE_DIR=\"$PWD\\.uv-cache\"; uv venv .venv; uv pip install --python .venv\\Scripts\\python.exe -r requirements.txt")
+            raise SystemExit(1) from exc
+        uv = shutil.which("uv")
+        if not uv:
+            print("当前项目虚拟环境缺少依赖，且未找到 uv。请先安装 uv，再按 README.md 安装依赖。")
+            raise SystemExit(1) from exc
+        cache_dir = os.path.join(ROOT, ".uv-cache")
+        temp_dir = os.path.join(ROOT, ".runtime", "tmp")
+        os.makedirs(cache_dir, exist_ok=True)
+        os.makedirs(temp_dir, exist_ok=True)
+        install_env = os.environ.copy()
+        install_env["UV_CACHE_DIR"] = cache_dir
+        install_env["TMPDIR"] = temp_dir
+        install_env["TMP"] = temp_dir
+        install_env["TEMP"] = temp_dir
+        print("使用 uv 在项目虚拟环境中安装依赖...")
+        subprocess.check_call([
+            uv, "pip", "install", "--python", sys.executable,
+            "-r", os.path.join(ROOT, "requirements.txt"),
+        ], cwd=ROOT, env=install_env)
         print("依赖安装完成\n")
 
 
@@ -42,8 +62,13 @@ def _start_server(port, state):
     os.chdir(ROOT)
     import app
     try:
+        try:
+            from integrations.mihuashi.sync_manager import start_manager
+            start_manager()
+        except Exception as e:
+            logging.exception('米画师同步管理器启动失败（不影响排单服务）: %s', e)
         app.start_feed_server()  # Spec20 卡 85：feed_enabled=1 时拉起 1097 第二监听（幂等）
-        app.app.run(debug=False, host="127.0.0.1", port=port)
+        app.app.run(debug=False, use_reloader=False, host="127.0.0.1", port=port)
     except Exception as e:
         state['error'] = str(e)
 
